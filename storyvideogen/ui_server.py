@@ -12,15 +12,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .auth_store import AuthError, AuthStore, SESSION_COOKIE_NAME
 from .interactive_workflow import (
     InteractiveSettings,
     add_manual_image_candidate,
     compose_interactive_project,
     prepare_interactive_project,
 )
+from .story_workspace import (
+    DEFAULT_WORKSPACE,
+    create_story_session,
+    list_stories,
+    load_story_payload,
+    write_story_session,
+)
 
 _PREPARE_JOBS: dict[str, dict[str, object]] = {}
 _PREPARE_LOCK = threading.Lock()
+_AUTH_STORE = AuthStore()
 
 
 def serve_ui(host: str = "127.0.0.1", port: int = 7860) -> None:
@@ -37,16 +46,44 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send_text(_HTML, "text/html; charset=utf-8")
             return
+        if parsed.path == "/api/me":
+            self._serve_current_user()
+            return
         if parsed.path == "/api/asset":
+            if not self._require_user():
+                return
             self._serve_asset(parsed.query)
             return
         if parsed.path == "/api/job":
+            if not self._require_user():
+                return
             self._serve_job(parsed.query)
+            return
+        if parsed.path == "/api/stories":
+            if not self._require_user():
+                return
+            self._serve_stories(parsed.query)
+            return
+        if parsed.path == "/api/story":
+            if not self._require_user():
+                return
+            self._serve_story(parsed.query)
             return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
         try:
+            if self.path == "/api/register":
+                self._handle_register()
+                return
+            if self.path == "/api/login":
+                self._handle_login()
+                return
+            if self.path == "/api/logout":
+                self._handle_logout()
+                return
+            if not self._require_user():
+                return
             if self.path == "/api/prepare":
                 self._handle_prepare()
                 return
@@ -55,6 +92,9 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/manual-image":
                 self._handle_manual_image()
+                return
+            if self.path == "/api/stories":
+                self._handle_create_story()
                 return
             self.send_error(404, "Not found")
         except Exception as exc:
@@ -65,10 +105,11 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
 
     def _handle_prepare(self) -> None:
         payload = self._read_json()
+        user = self._current_user()
         settings = InteractiveSettings(
             story_text=str(payload.get("story_text") or ""),
             title=str(payload.get("title") or ""),
-            output_dir=Path(str(payload.get("output_dir") or "")),
+            output_dir=_safe_user_output_dir(user, payload.get("output_dir")),
             target_seconds=_int(payload.get("target_seconds"), 90),
             width=_int(payload.get("width"), 1920),
             height=_int(payload.get("height"), 1080),
@@ -98,14 +139,51 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         }
         background_music = _optional_path(payload.get("background_music"))
         result = compose_interactive_project(
-            output_dir=Path(str(payload.get("output_dir") or "")),
+            output_dir=_safe_user_output_dir(self._current_user(), payload.get("output_dir")),
             selections=selections,
             background_music=background_music,
             music_volume=_float(payload.get("music_volume"), 0.18),
             tts_provider=str(payload.get("tts_provider") or "edge"),
             voice=str(payload.get("voice") or "zh-CN-XiaoxiaoNeural"),
         )
+        write_story_session(
+            _safe_user_output_dir(self._current_user(), payload.get("output_dir")),
+            status="composed",
+            message="Video composed.",
+            error="",
+            video_path=result.get("video_path"),
+        )
         self._send_json(result)
+
+    def _handle_create_story(self) -> None:
+        payload = self._read_json()
+        workspace = _user_workspace(self._current_user())
+        story = create_story_session(
+            workspace,
+            tag=payload.get("tag"),
+            title=payload.get("title"),
+            story_text=payload.get("story_text"),
+        )
+        self._send_json({"story": story, "stories": list_stories(workspace, _active_prepare_jobs_for_user(self._current_user()))})
+
+    def _handle_register(self) -> None:
+        payload = self._read_json()
+        user = _AUTH_STORE.register_user(str(payload.get("username") or ""), str(payload.get("password") or ""))
+        token = _AUTH_STORE.create_session(int(user["id"]))
+        self._send_json({"user": user, "workspace": str(_user_workspace(user))}, cookies=[_session_cookie(token)])
+
+    def _handle_login(self) -> None:
+        payload = self._read_json()
+        user = _AUTH_STORE.authenticate_user(str(payload.get("username") or ""), str(payload.get("password") or ""))
+        if user is None:
+            raise AuthError("Invalid username or password.")
+        token = _AUTH_STORE.create_session(int(user["id"]))
+        self._send_json({"user": user, "workspace": str(_user_workspace(user))}, cookies=[_session_cookie(token)])
+
+    def _handle_logout(self) -> None:
+        token = self._cookie_value(SESSION_COOKIE_NAME)
+        _AUTH_STORE.delete_session(token or "")
+        self._send_json({"ok": True}, cookies=[_clear_session_cookie()])
 
     def _handle_manual_image(self) -> None:
         form = cgi.FieldStorage(
@@ -117,7 +195,7 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
                 "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
             },
         )
-        output_dir = Path(str(form.getvalue("output_dir") or ""))
+        output_dir = _safe_user_output_dir(self._current_user(), form.getvalue("output_dir"))
         chunk_index = int(str(form.getvalue("chunk_index") or "0"))
         file_item = form["image"] if "image" in form else None
         if file_item is None or not getattr(file_item, "filename", ""):
@@ -130,13 +208,14 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             shutil.copyfileobj(file_item.file, target)
 
         result = add_manual_image_candidate(output_dir, chunk_index, upload_path)
+        write_story_session(output_dir, status="prepared", message=f"Local image selected for chunk {chunk_index}.")
         self._send_json(result)
 
     def _serve_asset(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
         raw_path = params.get("path", [""])[0]
         path = Path(raw_path)
-        if not path.is_file():
+        if not path.is_file() or not _path_belongs_to_user(self._current_user(), path):
             self.send_error(404, "Asset not found")
             return
 
@@ -157,7 +236,30 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         if payload is None:
             self._send_json({"error": "Unknown prepare job."}, status=404)
             return
+        if not _path_belongs_to_user(self._current_user(), Path(str(payload.get("output_dir") or ""))):
+            self._send_json({"error": "Unknown prepare job."}, status=404)
+            return
         self._send_json(payload)
+
+    def _serve_stories(self, query: str) -> None:
+        workspace = _user_workspace(self._current_user())
+        self._send_json({"stories": list_stories(workspace, _active_prepare_jobs_for_user(self._current_user()))})
+
+    def _serve_story(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        raw_output_dir = params.get("output_dir", [""])[0]
+        if not raw_output_dir:
+            self._send_json({"error": "output_dir is required."}, status=400)
+            return
+        output_dir = _safe_user_output_dir(self._current_user(), raw_output_dir)
+        self._send_json(load_story_payload(output_dir, _active_prepare_job_for_output(output_dir)))
+
+    def _serve_current_user(self) -> None:
+        user = self._current_user()
+        if user is None:
+            self._send_json({"user": None, "workspace": str(DEFAULT_WORKSPACE)})
+            return
+        self._send_json({"user": user, "workspace": str(_user_workspace(user))})
 
     def _read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -169,11 +271,13 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON request body must be an object.")
         return payload
 
-    def _send_json(self, payload: object, status: int = 200) -> None:
+    def _send_json(self, payload: object, status: int = 200, cookies: list[str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for cookie in cookies or []:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -184,6 +288,24 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _require_user(self) -> dict[str, object] | None:
+        user = self._current_user()
+        if user is None:
+            self._send_json({"error": "Authentication required."}, status=401)
+            return None
+        return user
+
+    def _current_user(self) -> dict[str, object] | None:
+        return _AUTH_STORE.user_for_session(self._cookie_value(SESSION_COOKIE_NAME) or "")
+
+    def _cookie_value(self, name: str) -> str | None:
+        raw_cookie = self.headers.get("Cookie", "")
+        for part in raw_cookie.split(";"):
+            key, separator, value = part.strip().partition("=")
+            if separator and key == name:
+                return urllib.parse.unquote(value)
+        return None
 
 
 def _int(value: object, default: int) -> int:
@@ -210,11 +332,62 @@ def _optional_path(value: object) -> Path | None:
     return Path(text) if text else None
 
 
+def _user_workspace(user: dict[str, object] | None) -> Path:
+    if user is None:
+        return DEFAULT_WORKSPACE
+    return _AUTH_STORE.workspace_for_user(user)
+
+
+def _safe_user_output_dir(user: dict[str, object] | None, value: object) -> Path:
+    workspace = _user_workspace(user)
+    raw_path = Path(str(value or ""))
+    if not str(raw_path):
+        raise ValueError("output_dir is required.")
+    if raw_path.is_absolute():
+        output_dir = raw_path
+    else:
+        output_dir = raw_path
+    try:
+        output_dir.resolve().relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise PermissionError("Story output directory must be inside the current user's workspace.") from exc
+    return output_dir
+
+
+def _path_belongs_to_user(user: dict[str, object] | None, path: Path) -> bool:
+    if not str(path):
+        return False
+    try:
+        path.resolve().relative_to(_user_workspace(user).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _session_cookie(token: str) -> str:
+    return f"{SESSION_COOKIE_NAME}={urllib.parse.quote(token)}; Path=/; HttpOnly; SameSite=Lax"
+
+
+def _clear_session_cookie() -> str:
+    return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+
 def _start_prepare_job(settings: InteractiveSettings) -> str:
     job_id = uuid.uuid4().hex
+    write_story_session(
+        settings.output_dir,
+        title=settings.title,
+        story_text=settings.story_text,
+        status="preparing",
+        message="Preparing story and prompts...",
+        job_id=job_id,
+        error="",
+    )
     with _PREPARE_LOCK:
         _PREPARE_JOBS[job_id] = {
             "job_id": job_id,
+            "output_dir": str(settings.output_dir),
+            "tag": settings.output_dir.name,
             "status": "running",
             "message": "Preparing story and prompts...",
             "project": None,
@@ -232,10 +405,12 @@ def _run_prepare_job(job_id: str, settings: InteractiveSettings) -> None:
     try:
         project = prepare_interactive_project(settings, progress_callback=progress)
     except Exception as exc:
+        write_story_session(settings.output_dir, status="failed", message="Prepare failed.", error=str(exc), job_id=job_id)
         with _PREPARE_LOCK:
             _PREPARE_JOBS[job_id].update({"status": "failed", "message": "Prepare failed.", "error": str(exc)})
         return
 
+    write_story_session(settings.output_dir, status="prepared", message="Image preparation complete.", error="", job_id=job_id)
     with _PREPARE_LOCK:
         _PREPARE_JOBS[job_id].update(
             {
@@ -271,6 +446,28 @@ def _replace_candidate(project: dict[str, object], candidate: dict[str, object])
             if isinstance(existing, dict) and int(existing.get("candidate_index", 0)) == candidate_index:
                 chunk["image_candidates"][position] = candidate
                 return
+
+
+def _active_prepare_jobs() -> list[dict[str, object]]:
+    with _PREPARE_LOCK:
+        return [copy.deepcopy(job) for job in _PREPARE_JOBS.values()]
+
+
+def _active_prepare_jobs_for_user(user: dict[str, object] | None) -> list[dict[str, object]]:
+    return [
+        job
+        for job in _active_prepare_jobs()
+        if _path_belongs_to_user(user, Path(str(job.get("output_dir") or "")))
+    ]
+
+
+def _active_prepare_job_for_output(output_dir: Path) -> dict[str, object] | None:
+    output_text = str(output_dir)
+    with _PREPARE_LOCK:
+        for job in reversed(list(_PREPARE_JOBS.values())):
+            if str(job.get("output_dir") or "") == output_text:
+                return copy.deepcopy(job)
+    return None
 
 
 _HTML = r"""<!doctype html>
@@ -332,6 +529,13 @@ _HTML = r"""<!doctype html>
     .grid {
       display: grid;
       grid-template-columns: minmax(320px, 440px) 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .workspace-grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 320px) 1fr;
       gap: 18px;
       align-items: start;
     }
@@ -424,6 +628,73 @@ _HTML = r"""<!doctype html>
       white-space: pre-wrap;
     }
 
+    .story-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .story-item {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fffaf0;
+      color: var(--ink);
+      box-shadow: none;
+      display: grid;
+      gap: 4px;
+      padding: 12px;
+      text-align: left;
+    }
+
+    .story-item.active {
+      border-color: var(--accent);
+      box-shadow: 0 10px 24px rgba(94, 35, 22, 0.16);
+    }
+
+    .story-item strong {
+      font-size: 16px;
+    }
+
+    .story-item span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.25;
+    }
+
+    .badge {
+      border-radius: 999px;
+      background: rgba(53, 83, 75, 0.14);
+      color: #27413b;
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      padding: 4px 8px;
+      text-transform: uppercase;
+      width: fit-content;
+    }
+
+    .auth-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(260px, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .user-bar {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
     .chunk {
       border-top: 1px solid var(--line);
       padding: 18px 0;
@@ -499,6 +770,8 @@ _HTML = r"""<!doctype html>
     }
 
     @media (max-width: 900px) {
+      .auth-grid { grid-template-columns: 1fr; }
+      .workspace-grid { grid-template-columns: 1fr; }
       .grid { grid-template-columns: 1fr; }
       .row { grid-template-columns: 1fr; }
     }
@@ -511,12 +784,57 @@ _HTML = r"""<!doctype html>
       <div class="lede">Prepare story chunks, generate several image candidates for each chunk, choose the visuals, then compose the final Chinese-narrated video with optional looping background music.</div>
     </section>
 
-    <section class="grid">
-      <form id="settings" class="panel">
-        <h2>Project</h2>
-        <label>English title <input name="title" value="Story Title"></label>
-        <label>Target output directory <input name="output_dir" value="output/ui_project"></label>
-        <label>Story text <textarea name="story_text" placeholder="Paste the story here..."></textarea></label>
+    <section id="auth-panel" class="auth-grid">
+      <form id="login-form" class="panel">
+        <h2>Login</h2>
+        <label>Username <input name="username" autocomplete="username"></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password"></label>
+        <div class="actions">
+          <button type="submit">Login</button>
+        </div>
+        <div id="login-status" class="status"></div>
+      </form>
+
+      <form id="register-form" class="panel">
+        <h2>Register</h2>
+        <label>Username <input name="username" autocomplete="username"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+        <div class="hint">Username: 3-40 letters, numbers, dot, dash, or underscore. Password: at least 8 characters.</div>
+        <div class="actions">
+          <button type="submit">Create Account</button>
+        </div>
+        <div id="register-status" class="status"></div>
+      </form>
+    </section>
+
+    <section id="app-panel" class="hidden">
+      <div class="panel user-bar">
+        <div>
+          <strong id="current-user">Not logged in</strong>
+          <div id="current-workspace" class="hint"></div>
+        </div>
+        <button type="button" id="logout" class="secondary">Logout</button>
+      </div>
+
+    <section class="workspace-grid">
+      <aside class="panel">
+        <h2>Stories</h2>
+        <label>Workspace <input id="workspace" value="output/ui_stories" readonly></label>
+        <label>New story tag <input id="new-story-tag" placeholder="scp-173-test"></label>
+        <div class="actions">
+          <button type="button" id="create-story">Create New Story</button>
+          <button type="button" id="refresh-stories" class="secondary">Refresh</button>
+        </div>
+        <div id="story-list-status" class="status"></div>
+        <div id="story-list" class="story-list">Loading stories...</div>
+      </aside>
+
+      <section class="grid">
+        <form id="settings" class="panel">
+          <h2>Project</h2>
+          <label>English title <input name="title" value="Story Title"></label>
+          <label>Target output directory <input name="output_dir" value="output/ui_stories/story-title"></label>
+          <label>Story text <textarea name="story_text" placeholder="Paste the story here..."></textarea></label>
 
         <h2>Generation</h2>
         <div class="row">
@@ -595,33 +913,92 @@ _HTML = r"""<!doctype html>
           <button type="button" id="compose" class="secondary" disabled>Compose Video</button>
         </div>
         <div id="status" class="status"></div>
-      </form>
+        </form>
 
-      <section class="panel">
-        <h2>Image Choices</h2>
-        <div id="chunks">Prepare a project to see image candidates.</div>
+        <section class="panel">
+          <h2>Image Choices</h2>
+          <div id="chunks">Create or select a story to begin.</div>
+        </section>
       </section>
+    </section>
     </section>
   </main>
 
   <script>
+    const authPanel = document.querySelector("#auth-panel");
+    const appPanel = document.querySelector("#app-panel");
+    const loginForm = document.querySelector("#login-form");
+    const registerForm = document.querySelector("#register-form");
+    const loginStatusEl = document.querySelector("#login-status");
+    const registerStatusEl = document.querySelector("#register-status");
+    const currentUserEl = document.querySelector("#current-user");
+    const currentWorkspaceEl = document.querySelector("#current-workspace");
+    const logoutButton = document.querySelector("#logout");
     const form = document.querySelector("#settings");
+    const workspaceInput = document.querySelector("#workspace");
+    const newStoryTagInput = document.querySelector("#new-story-tag");
+    const createStoryButton = document.querySelector("#create-story");
+    const refreshStoriesButton = document.querySelector("#refresh-stories");
+    const storyListStatusEl = document.querySelector("#story-list-status");
+    const storyListEl = document.querySelector("#story-list");
     const statusEl = document.querySelector("#status");
     const chunksEl = document.querySelector("#chunks");
     const prepareButton = document.querySelector("#prepare");
     const composeButton = document.querySelector("#compose");
     window.manualSelections = {};
     window.canCompose = false;
+    window.currentStory = null;
+    window.currentProject = null;
+    window.stories = [];
+    window.activeWatchers = {};
+    window.editorBusy = false;
 
     function formPayload() {
       const data = new FormData(form);
       return Object.fromEntries(data.entries());
     }
 
-    function setBusy(isBusy, message) {
-      prepareButton.disabled = isBusy;
-      composeButton.disabled = isBusy || !window.currentProject;
+    function workspaceValue() {
+      return workspaceInput.value.trim() || "output/ui_stories";
+    }
+
+    function authPayload(authForm) {
+      const data = new FormData(authForm);
+      return Object.fromEntries(data.entries());
+    }
+
+    function showAuth() {
+      authPanel.classList.remove("hidden");
+      appPanel.classList.add("hidden");
+      currentUserEl.textContent = "Not logged in";
+      currentWorkspaceEl.textContent = "";
+    }
+
+    async function showApp(user, workspace) {
+      authPanel.classList.add("hidden");
+      appPanel.classList.remove("hidden");
+      currentUserEl.textContent = `Logged in as ${user.username}`;
+      currentWorkspaceEl.textContent = workspace;
+      workspaceInput.value = workspace;
+      await loadStories();
+    }
+
+    function setField(name, value) {
+      const field = form.elements[name];
+      if (field) {
+        field.value = value ?? "";
+      }
+    }
+
+    function setEditorStatus(message) {
       statusEl.textContent = message || "";
+      updateEditorControls();
+    }
+
+    function updateEditorControls() {
+      const isPreparing = window.currentStory && window.currentStory.status === "preparing";
+      prepareButton.disabled = window.editorBusy || isPreparing;
+      composeButton.disabled = window.editorBusy || isPreparing || !window.currentProject || !window.canCompose;
     }
 
     async function postJson(url, payload) {
@@ -631,6 +1008,10 @@ _HTML = r"""<!doctype html>
         body: JSON.stringify(payload)
       });
       const data = await response.json();
+      if (response.status === 401) {
+        showAuth();
+        throw new Error("Login required.");
+      }
       if (!response.ok || data.error) {
         throw new Error(data.error || `Request failed: ${response.status}`);
       }
@@ -640,10 +1021,133 @@ _HTML = r"""<!doctype html>
     async function getJson(url) {
       const response = await fetch(url);
       const data = await response.json();
+      if (response.status === 401) {
+        showAuth();
+        throw new Error("Login required.");
+      }
       if (!response.ok || data.error) {
         throw new Error(data.error || `Request failed: ${response.status}`);
       }
       return data;
+    }
+
+    async function loadStories() {
+      const result = await getJson(`/api/stories?workspace=${encodeURIComponent(workspaceValue())}`);
+      window.stories = result.stories || [];
+      renderStoryList(window.stories);
+      for (const story of window.stories) {
+        if (story.status === "preparing" && story.job_id) {
+          watchPrepareJob(story.job_id, story.output_dir);
+        }
+      }
+      return window.stories;
+    }
+
+    async function loadCurrentUser() {
+      const session = await getJson("/api/me");
+      if (session.user) {
+        await showApp(session.user, session.workspace);
+      } else {
+        showAuth();
+      }
+    }
+
+    function renderStoryList(stories) {
+      storyListEl.innerHTML = "";
+      if (!stories.length) {
+        storyListEl.textContent = "No stories yet. Create a tag to start.";
+        return;
+      }
+      for (const story of stories) {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "story-item";
+        if (window.currentStory && story.output_dir === window.currentStory.output_dir) {
+          item.classList.add("active");
+        }
+
+        const title = document.createElement("strong");
+        title.textContent = story.title || story.tag;
+        item.appendChild(title);
+
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = story.status || "draft";
+        item.appendChild(badge);
+
+        const message = document.createElement("span");
+        message.textContent = story.message || story.output_dir;
+        item.appendChild(message);
+
+        const output = document.createElement("span");
+        output.textContent = story.output_dir;
+        item.appendChild(output);
+
+        item.addEventListener("click", () => loadStory(story.output_dir));
+        storyListEl.appendChild(item);
+      }
+    }
+
+    async function createStory() {
+      const tag = newStoryTagInput.value.trim() || `story-${Date.now()}`;
+      storyListStatusEl.textContent = "Creating story...";
+      const result = await postJson("/api/stories", {
+        workspace: workspaceValue(),
+        tag
+      });
+      newStoryTagInput.value = "";
+      window.stories = result.stories || [];
+      renderStoryList(window.stories);
+      await loadStory(result.story.output_dir);
+      storyListStatusEl.textContent = `Created ${result.story.tag}.`;
+    }
+
+    async function loadStory(outputDir) {
+      const result = await getJson(`/api/story?output_dir=${encodeURIComponent(outputDir)}`);
+      window.currentStory = result.story;
+      window.currentProject = result.project || null;
+      window.canCompose = false;
+      window.manualSelections = {};
+      populateForm(result.story, result.project);
+      if (result.project) {
+        const canCompose = ["prepared", "composed"].includes(result.story.status);
+        renderProject(result.project, canCompose);
+      } else {
+        chunksEl.textContent = "Prepare this story to see image candidates.";
+        window.canCompose = false;
+      }
+      setEditorStatus(result.story.message || `Loaded ${result.story.tag}.`);
+      renderStoryList(window.stories);
+      if (result.story.status === "preparing" && result.story.job_id) {
+        watchPrepareJob(result.story.job_id, result.story.output_dir);
+      }
+    }
+
+    function populateForm(story, project) {
+      const settings = (project && project.settings) || story.settings || {};
+      setField("title", story.title || story.tag || "Story Title");
+      setField("output_dir", story.output_dir || "");
+      setField("story_text", story.story_text || "");
+      for (const name of [
+        "target_seconds",
+        "chunk_seconds",
+        "candidates_per_chunk",
+        "image_workers",
+        "width",
+        "height",
+        "translator",
+        "translation_model",
+        "prompt_provider",
+        "prompt_model",
+        "image_provider",
+        "image_model",
+        "tts_provider",
+        "voice"
+      ]) {
+        if (settings[name] !== undefined) {
+          setField(name, settings[name]);
+        }
+      }
     }
 
     function renderProject(project, canCompose = false) {
@@ -715,7 +1219,7 @@ _HTML = r"""<!doctype html>
         section.appendChild(cards);
         chunksEl.appendChild(section);
       }
-      composeButton.disabled = !canCompose;
+      updateEditorControls();
     }
 
     async function chooseLocalImage(chunkIndex) {
@@ -747,6 +1251,7 @@ _HTML = r"""<!doctype html>
           window.manualSelections[chunkIndex] = result.candidate.candidate_index;
           renderProject(result.project, window.canCompose);
           statusEl.textContent = `Local image selected for chunk ${chunkIndex}.`;
+          await loadStories();
         } catch (error) {
           statusEl.textContent = error.message;
         }
@@ -756,6 +1261,9 @@ _HTML = r"""<!doctype html>
 
     function selectedCandidates() {
       const selections = {};
+      if (!window.currentProject) {
+        return selections;
+      }
       for (const chunk of window.currentProject.chunks) {
         const selected = document.querySelector(`input[name="chunk-${chunk.index}"]:checked`);
         if (selected) {
@@ -767,32 +1275,76 @@ _HTML = r"""<!doctype html>
 
     prepareButton.addEventListener("click", async () => {
       try {
+        const payload = formPayload();
         window.currentProject = null;
-        composeButton.disabled = true;
-        setBusy(true, "Preparing story, translating, generating detailed Chinese prompts, and starting image generation...");
+        window.canCompose = false;
+        if (window.currentStory) {
+          window.currentStory.status = "preparing";
+          window.currentStory.message = "Preparing story, translating, generating detailed Chinese prompts, and starting image generation...";
+        }
+        setEditorStatus("Preparing story, translating, generating detailed Chinese prompts, and starting image generation...");
         chunksEl.textContent = "Waiting for prompt plan...";
-        const job = await postJson("/api/prepare", formPayload());
-        await pollPrepareJob(job.job_id);
+        const job = await postJson("/api/prepare", payload);
+        if (window.currentStory) {
+          window.currentStory.job_id = job.job_id;
+        }
+        watchPrepareJob(job.job_id, payload.output_dir);
+        await loadStories();
       } catch (error) {
-        setBusy(false, error.message);
+        if (window.currentStory) {
+          window.currentStory.status = "failed";
+        }
+        setEditorStatus(error.message);
       }
     });
 
-    async function pollPrepareJob(jobId) {
-      while (true) {
+    function watchPrepareJob(jobId, outputDir) {
+      if (!jobId || window.activeWatchers[jobId]) {
+        return;
+      }
+      window.activeWatchers[jobId] = true;
+      pollPrepareJob(jobId, outputDir);
+    }
+
+    async function pollPrepareJob(jobId, outputDir) {
+      try {
         const job = await getJson(`/api/job?job_id=${encodeURIComponent(jobId)}`);
-        if (job.project) {
+        const isCurrent = window.currentStory && window.currentStory.output_dir === outputDir;
+        if (job.project && isCurrent) {
           renderProject(job.project, job.status === "complete");
         }
+        if (isCurrent) {
+          window.currentStory.status = job.status === "running" ? "preparing" : job.status === "complete" ? "prepared" : "failed";
+          window.currentStory.message = job.message || "";
+          statusEl.textContent = job.error || job.message || "Generating image candidates...";
+          updateEditorControls();
+        }
+
         if (job.status === "complete") {
-          setBusy(false, `Prepared ${job.project.chunks.length} chunks. Pick one image per chunk, then compose.`);
+          delete window.activeWatchers[jobId];
+          await loadStories();
+          if (isCurrent) {
+            await loadStory(outputDir);
+            statusEl.textContent = `Prepared ${job.project.chunks.length} chunks. Pick one image per chunk, then compose.`;
+          }
           return;
         }
         if (job.status === "failed") {
-          throw new Error(job.error || "Prepare failed.");
+          delete window.activeWatchers[jobId];
+          await loadStories();
+          if (isCurrent) {
+            statusEl.textContent = job.error || "Prepare failed.";
+            updateEditorControls();
+          }
+          return;
         }
-        statusEl.textContent = job.message || "Generating image candidates...";
-        await new Promise((resolve) => setTimeout(resolve, 1200));
+        setTimeout(() => pollPrepareJob(jobId, outputDir), 1200);
+      } catch (error) {
+        delete window.activeWatchers[jobId];
+        if (window.currentStory && window.currentStory.output_dir === outputDir) {
+          statusEl.textContent = error.message;
+          updateEditorControls();
+        }
       }
     }
 
@@ -800,13 +1352,91 @@ _HTML = r"""<!doctype html>
       try {
         const payload = formPayload();
         payload.selections = selectedCandidates();
-        setBusy(true, "Composing final video...");
+        window.editorBusy = true;
+        setEditorStatus("Composing final video...");
         const result = await postJson("/api/compose", payload);
-        setBusy(false, `Video complete:\n${result.video_path || result.run_plan}`);
+        window.editorBusy = false;
+        setEditorStatus(`Video complete:\n${result.video_path || result.run_plan}`);
+        await loadStories();
+        await loadStory(payload.output_dir);
       } catch (error) {
-        setBusy(false, error.message);
+        window.editorBusy = false;
+        setEditorStatus(error.message);
       }
     });
+
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        loginStatusEl.textContent = "Logging in...";
+        const result = await postJson("/api/login", authPayload(loginForm));
+        loginForm.reset();
+        loginStatusEl.textContent = "";
+        await showApp(result.user, result.workspace);
+      } catch (error) {
+        loginStatusEl.textContent = error.message;
+      }
+    });
+
+    registerForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        registerStatusEl.textContent = "Creating account...";
+        const result = await postJson("/api/register", authPayload(registerForm));
+        registerForm.reset();
+        registerStatusEl.textContent = "";
+        await showApp(result.user, result.workspace);
+      } catch (error) {
+        registerStatusEl.textContent = error.message;
+      }
+    });
+
+    logoutButton.addEventListener("click", async () => {
+      try {
+        await postJson("/api/logout", {});
+      } finally {
+        window.currentStory = null;
+        window.currentProject = null;
+        window.stories = [];
+        storyListEl.textContent = "Login to load stories.";
+        chunksEl.textContent = "Create or select a story to begin.";
+        showAuth();
+      }
+    });
+
+    createStoryButton.addEventListener("click", async () => {
+      try {
+        await createStory();
+      } catch (error) {
+        storyListStatusEl.textContent = error.message;
+      }
+    });
+
+    refreshStoriesButton.addEventListener("click", async () => {
+      try {
+        storyListStatusEl.textContent = "Refreshing...";
+        await loadStories();
+        storyListStatusEl.textContent = "";
+      } catch (error) {
+        storyListStatusEl.textContent = error.message;
+      }
+    });
+
+    async function initialize() {
+      try {
+        await loadCurrentUser();
+        const stories = window.stories;
+        if (stories.length) {
+          await loadStory(stories[0].output_dir);
+        } else {
+          updateEditorControls();
+        }
+      } catch (error) {
+        storyListStatusEl.textContent = error.message;
+      }
+    }
+
+    initialize();
   </script>
 </body>
 </html>
