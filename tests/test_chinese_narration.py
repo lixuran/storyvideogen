@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from storyvideogen.models import StoryChunk
-from storyvideogen.pipeline import _build_narration_text
+from storyvideogen.pipeline import _build_narration_text, _chunk_max_words
 
 
 class ChineseNarrationTest(unittest.TestCase):
@@ -37,6 +37,9 @@ class ChineseNarrationTest(unittest.TestCase):
         narration_text = _build_narration_text(chunks)
 
         self.assertEqual(narration_text, "Already translated text.")
+
+    def test_chunk_max_words_targets_roughly_thirty_seconds(self) -> None:
+        self.assertEqual(_chunk_max_words(words_per_minute=145, chunk_seconds=30), 72)
 
 
 if __name__ == "__main__":

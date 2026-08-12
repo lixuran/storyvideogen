@@ -32,6 +32,12 @@ Install optional ZAI dependency for prompt planning and meaning-based Chinese tr
 pip install zai-sdk
 ```
 
+Zhipu `glm-image` is the default generated-image provider:
+
+```bash
+$env:ZHIPU_IMAGE_API_KEY="your-zhipu-or-bigmodel-api-key"
+```
+
 Offline full render test:
 
 ```bash
@@ -42,7 +48,8 @@ Live MVP path:
 
 ```bash
 $env:ZAI_API_KEY="your-zai-api-key"
-python -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --translator zai --translation-model glm-5.2 --image-provider openverse --tts-provider edge --author "Author Name" --source-url "https://example.com/story" --story-license "CC BY-SA 3.0"
+$env:ZHIPU_IMAGE_API_KEY="your-zhipu-or-bigmodel-api-key"
+python -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --chunk-seconds 30 --translator zai --translation-model glm-5.2 --image-provider zhipu --image-model glm-image --tts-provider edge --author "Author Name" --source-url "https://example.com/story" --story-license "CC BY-SA 3.0"
 ```
 
 Faster image path with Pixabay:

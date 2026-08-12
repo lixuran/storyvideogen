@@ -51,7 +51,12 @@ class ZAIPromptAgent:
         prompts = _parse_llm_prompts(message_content(response), expected_count=len(chunks))
         return [_sanitize_prompt(prompt) for prompt in prompts]
 
-    def generate_prompt_candidates(self, chunks: list[StoryChunk], candidates_per_chunk: int) -> list[list[str]]:
+    def generate_prompt_candidates(
+        self,
+        chunks: list[StoryChunk],
+        candidates_per_chunk: int,
+        story_context: str = "",
+    ) -> list[list[str]]:
         if not chunks:
             return []
         try:
@@ -64,9 +69,9 @@ class ZAIPromptAgent:
             model=self.model,
             messages=[
                 {"role": "system", "content": _LLM_CANDIDATE_INSTRUCTIONS},
-                {"role": "user", "content": _build_candidate_input(chunks, candidates_per_chunk)},
+                {"role": "user", "content": _build_candidate_input(chunks, candidates_per_chunk, story_context)},
             ],
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=0.4,
         )
         groups = _parse_llm_prompt_candidates(
@@ -94,20 +99,22 @@ Rules:
 """
 
 
-_LLM_CANDIDATE_INSTRUCTIONS = """You generate diverse fast image-search prompts for cozy-creepy story videos.
+_LLM_CANDIDATE_INSTRUCTIONS = """你是恐怖睡前故事视频的分镜美术提示词规划师。
 
-Return only JSON:
-{"prompt_groups":[["prompt 1a","prompt 1b"],["prompt 2a","prompt 2b"]]}
+只返回 JSON：
+{"prompt_groups":[["提示词1A","提示词1B"],["提示词2A","提示词2B"]]}
 
-Rules:
-- One prompt group per input chunk, same order.
-- Each group must contain the requested number of distinct prompts.
-- Each prompt is 2-6 English words.
-- Use concrete searchable visual nouns, not abstract mood words.
-- Vary subject, framing, and object focus across prompts.
-- Prefer real-photo searchable subjects over illustration terms.
-- For SCP-style entities, do not use exact SCP names. Use generic related visuals.
-- Avoid copyrighted character names, site-specific names, long sentences, and Markdown fences.
+规则：
+- 每个输入片段生成一组提示词，顺序必须一致。
+- 每组必须包含要求数量的不同提示词。
+- 提示词必须使用简体中文。
+- 每条提示词应为 40-90 个中文字符，适合图像生成模型。
+- 必须利用 story_context 理解全局故事、实体、地点、危险规则和前后文连续性。
+- 每条提示词要具体描述主体、场景、构图、光线、质感、镜头距离和氛围。
+- 同一片段内的候选提示词要在构图、焦点或视角上明显不同。
+- 保持“温暖但诡异”的睡前恐怖氛围，避免血腥猎奇。
+- SCP 类内容不要直接写 SCP 编号或专有站点名，改写成“异常混凝土雕像”“收容室”等通用视觉。
+- 不要加入字幕、文字、水印、logo、解释、Markdown 代码块。
 """
 
 
@@ -207,12 +214,13 @@ def generate_prompt_candidates(
     chunks: list[StoryChunk],
     provider: PromptProvider | None = None,
     candidates_per_chunk: int = 3,
+    story_context: str = "",
 ) -> list[list[str]]:
     prompt_provider = provider or HeuristicPromptProvider()
     count = max(1, candidates_per_chunk)
     generator = getattr(prompt_provider, "generate_prompt_candidates", None)
     if callable(generator):
-        groups = generator(chunks, count)
+        groups = generator(chunks, count, story_context)
     else:
         groups = [_diversify_prompt(build_image_prompt(chunk.text), chunk.text, count) for chunk in chunks]
 
@@ -254,9 +262,10 @@ def _build_llm_input(chunks: list[StoryChunk]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _build_candidate_input(chunks: list[StoryChunk], candidates_per_chunk: int) -> str:
+def _build_candidate_input(chunks: list[StoryChunk], candidates_per_chunk: int, story_context: str = "") -> str:
     payload = {
         "candidates_per_chunk": candidates_per_chunk,
+        "story_context": story_context,
         "chunks": [
             {
                 "index": chunk.index,
@@ -312,10 +321,19 @@ def _parse_llm_prompt_candidates(
 
 
 def _sanitize_prompt(prompt: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", prompt):
+        return _sanitize_chinese_prompt(prompt)
     words = re.findall(r"[A-Za-z0-9'-]+", prompt.lower())
     if not words:
         return "dark abandoned room"
     return " ".join(words[:6])
+
+
+def _sanitize_chinese_prompt(prompt: str) -> str:
+    clean = re.sub(r"\s+", "，", prompt.strip())
+    clean = re.sub(r"[`#*_{}\[\]<>]", "", clean)
+    clean = clean.strip("，。；; ")
+    return clean[:140] or "昏暗的异常收容室，柔和暖光，诡异安静的氛围"
 
 
 def _normalize_prompt_group(prompts: list[str], count: int) -> list[str]:

@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--title", required=True, help="English title shown on the title card.")
     generate_parser.add_argument("--out", required=True, type=Path, help="Output directory.")
     generate_parser.add_argument("--target-seconds", type=int, default=90, help="Target video duration.")
+    generate_parser.add_argument("--chunk-seconds", type=int, default=30, help="Approximate duration per visual chunk.")
     generate_parser.add_argument(
         "--translator",
         choices=["google", "identity", "mock", "zai"],
@@ -35,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument(
         "--prompt-provider",
         choices=["heuristic", "llm", "zai"],
-        default="heuristic",
+        default="zai",
         help="Image prompt generator. Use zai for model-based prompt planning.",
     )
     generate_parser.add_argument(
@@ -45,9 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.add_argument(
         "--image-provider",
-        choices=["baidu", "fixture", "openverse", "pixabay", "wikimedia"],
-        default="openverse",
+        choices=["baidu", "fixture", "openverse", "pixabay", "siliconflow", "wikimedia", "zhipu"],
+        default="zhipu",
         help="Image source provider. Use fixture for deterministic offline testing.",
+    )
+    generate_parser.add_argument(
+        "--image-model",
+        default="glm-image",
+        help="Image generation model for providers that support model selection.",
     )
     generate_parser.add_argument(
         "--image-workers",
@@ -86,11 +92,13 @@ def main(argv: list[str] | None = None) -> int:
             title=args.title,
             output_dir=args.out,
             target_seconds=args.target_seconds,
+            chunk_seconds=args.chunk_seconds,
             translator=args.translator,
             translation_model=args.translation_model,
             prompt_provider=args.prompt_provider,
             prompt_model=args.prompt_model,
             image_provider=args.image_provider,
+            image_model=args.image_model,
             image_workers=args.image_workers,
             tts_provider=args.tts_provider,
             voice=args.voice,

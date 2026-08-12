@@ -9,6 +9,7 @@ from storyvideogen.prompt_generator import (
     ZAIPromptAgent,
     _parse_llm_prompts,
     _parse_llm_prompt_candidates,
+    _sanitize_prompt,
     add_image_prompts,
     build_image_prompt,
     build_prompt_provider,
@@ -96,6 +97,12 @@ class PromptGeneratorTest(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(groups[0]), 3)
         self.assertGreaterEqual(len(set(groups[0])), 2)
+
+    def test_sanitize_prompt_preserves_chinese_image_prompt(self) -> None:
+        prompt = _sanitize_prompt("昏暗的异常收容室，混凝土雕像站在角落，暖色手电光，近景构图，压抑安静")
+
+        self.assertIn("异常收容室", prompt)
+        self.assertNotEqual(prompt, "dark abandoned room")
 
 
 if __name__ == "__main__":

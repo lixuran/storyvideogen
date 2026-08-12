@@ -144,7 +144,7 @@ class BaiduImageProvider:
         if payload.get("antiFlag") == 1:
             raise RuntimeError(
                 "Baidu blocked automated image search. Set BAIDU_COOKIE from a logged-in browser session "
-                "or use --image-provider pixabay/openverse."
+                "or use --image-provider zhipu/siliconflow/pixabay/openverse."
             )
         return [item for item in payload.get("data", []) if isinstance(item, dict)]
 

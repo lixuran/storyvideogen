@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import copy
+import cgi
 import json
 import mimetypes
+import shutil
+import threading
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .interactive_workflow import InteractiveSettings, compose_interactive_project, prepare_interactive_project
+from .interactive_workflow import (
+    InteractiveSettings,
+    add_manual_image_candidate,
+    compose_interactive_project,
+    prepare_interactive_project,
+)
+
+_PREPARE_JOBS: dict[str, dict[str, object]] = {}
+_PREPARE_LOCK = threading.Lock()
 
 
 def serve_ui(host: str = "127.0.0.1", port: int = 7860) -> None:
@@ -27,6 +40,9 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/asset":
             self._serve_asset(parsed.query)
             return
+        if parsed.path == "/api/job":
+            self._serve_job(parsed.query)
+            return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
@@ -36,6 +52,9 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/compose":
                 self._handle_compose()
+                return
+            if self.path == "/api/manual-image":
+                self._handle_manual_image()
                 return
             self.send_error(404, "Not found")
         except Exception as exc:
@@ -53,21 +72,23 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             target_seconds=_int(payload.get("target_seconds"), 90),
             width=_int(payload.get("width"), 1920),
             height=_int(payload.get("height"), 1080),
+            chunk_seconds=_int(payload.get("chunk_seconds"), 30),
             translator=str(payload.get("translator") or "zai"),
             translation_model=str(payload.get("translation_model") or "glm-5.2"),
             prompt_provider=str(payload.get("prompt_provider") or "zai"),
             prompt_model=str(payload.get("prompt_model") or "glm-5.2"),
-            image_provider=str(payload.get("image_provider") or "baidu"),
-            image_workers=_int(payload.get("image_workers"), 6),
-            candidates_per_chunk=_int(payload.get("candidates_per_chunk"), 3),
+            image_provider=str(payload.get("image_provider") or "zhipu"),
+            image_model=str(payload.get("image_model") or "glm-image"),
+            image_workers=_int(payload.get("image_workers"), 1),
+            candidates_per_chunk=_int(payload.get("candidates_per_chunk"), 2),
             tts_provider=str(payload.get("tts_provider") or "edge"),
             voice=str(payload.get("voice") or "zh-CN-XiaoxiaoNeural"),
             source_url=_optional_text(payload.get("source_url")),
             author=_optional_text(payload.get("author")),
             story_license=_optional_text(payload.get("story_license")),
         )
-        project = prepare_interactive_project(settings)
-        self._send_json(project)
+        job_id = _start_prepare_job(settings)
+        self._send_json({"job_id": job_id})
 
     def _handle_compose(self) -> None:
         payload = self._read_json()
@@ -86,6 +107,31 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         )
         self._send_json(result)
 
+    def _handle_manual_image(self) -> None:
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+            },
+        )
+        output_dir = Path(str(form.getvalue("output_dir") or ""))
+        chunk_index = int(str(form.getvalue("chunk_index") or "0"))
+        file_item = form["image"] if "image" in form else None
+        if file_item is None or not getattr(file_item, "filename", ""):
+            raise ValueError("Manual image upload requires an image file.")
+
+        upload_dir = output_dir / "manual_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_path = upload_dir / Path(str(file_item.filename)).name
+        with upload_path.open("wb") as target:
+            shutil.copyfileobj(file_item.file, target)
+
+        result = add_manual_image_candidate(output_dir, chunk_index, upload_path)
+        self._send_json(result)
+
     def _serve_asset(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
         raw_path = params.get("path", [""])[0]
@@ -101,6 +147,17 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_job(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        job_id = params.get("job_id", [""])[0]
+        with _PREPARE_LOCK:
+            job = _PREPARE_JOBS.get(job_id)
+            payload = copy.deepcopy(job) if job else None
+        if payload is None:
+            self._send_json({"error": "Unknown prepare job."}, status=404)
+            return
+        self._send_json(payload)
 
     def _read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -151,6 +208,69 @@ def _optional_text(value: object) -> str | None:
 def _optional_path(value: object) -> Path | None:
     text = str(value or "").strip()
     return Path(text) if text else None
+
+
+def _start_prepare_job(settings: InteractiveSettings) -> str:
+    job_id = uuid.uuid4().hex
+    with _PREPARE_LOCK:
+        _PREPARE_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "message": "Preparing story and prompts...",
+            "project": None,
+            "error": "",
+        }
+    thread = threading.Thread(target=_run_prepare_job, args=(job_id, settings), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_prepare_job(job_id: str, settings: InteractiveSettings) -> None:
+    def progress(event: dict[str, object]) -> None:
+        _apply_prepare_progress(job_id, event)
+
+    try:
+        project = prepare_interactive_project(settings, progress_callback=progress)
+    except Exception as exc:
+        with _PREPARE_LOCK:
+            _PREPARE_JOBS[job_id].update({"status": "failed", "message": "Prepare failed.", "error": str(exc)})
+        return
+
+    with _PREPARE_LOCK:
+        _PREPARE_JOBS[job_id].update(
+            {
+                "status": "complete",
+                "message": "Image preparation complete.",
+                "project": project,
+                "error": "",
+            }
+        )
+
+
+def _apply_prepare_progress(job_id: str, event: dict[str, object]) -> None:
+    with _PREPARE_LOCK:
+        job = _PREPARE_JOBS[job_id]
+        if event.get("type") == "project":
+            job["project"] = event["project"]
+            job["message"] = "Generating image candidates..."
+        elif event.get("type") == "candidate":
+            project = job.get("project")
+            candidate = event.get("candidate")
+            if isinstance(project, dict) and isinstance(candidate, dict):
+                _replace_candidate(project, candidate)
+                job["message"] = f"Generated candidate {candidate['candidate_index']} for chunk {candidate['chunk_index']}."
+
+
+def _replace_candidate(project: dict[str, object], candidate: dict[str, object]) -> None:
+    chunk_index = int(candidate["chunk_index"])
+    candidate_index = int(candidate["candidate_index"])
+    for chunk in project.get("chunks", []):
+        if not isinstance(chunk, dict) or int(chunk.get("index", 0)) != chunk_index:
+            continue
+        for position, existing in enumerate(chunk.get("image_candidates", [])):
+            if isinstance(existing, dict) and int(existing.get("candidate_index", 0)) == candidate_index:
+                chunk["image_candidates"][position] = candidate
+                return
 
 
 _HTML = r"""<!doctype html>
@@ -242,6 +362,13 @@ _HTML = r"""<!doctype html>
       color: var(--muted);
     }
 
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      margin-top: -4px;
+    }
+
     input, select, textarea {
       width: 100%;
       border: 1px solid var(--line);
@@ -321,6 +448,20 @@ _HTML = r"""<!doctype html>
       margin-top: 12px;
     }
 
+    .chunk-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .chunk-actions button {
+      background: #35534b;
+      box-shadow: 0 10px 24px rgba(35, 72, 62, 0.22);
+      font-size: 14px;
+      padding: 10px 14px;
+    }
+
     .candidate {
       position: relative;
       border: 1px solid var(--line);
@@ -380,8 +521,14 @@ _HTML = r"""<!doctype html>
         <h2>Generation</h2>
         <div class="row">
           <label>Target seconds <input name="target_seconds" type="number" value="90"></label>
-          <label>Candidates per chunk <input name="candidates_per_chunk" type="number" min="1" max="6" value="3"></label>
+          <label>Seconds per image chunk <input name="chunk_seconds" type="number" min="5" max="120" value="30"></label>
         </div>
+        <div class="hint">Higher chunk seconds means fewer, longer visual sections. Example: 120s video at 30s per chunk gives about 4 chunks.</div>
+        <div class="row">
+          <label>Candidates per chunk <input name="candidates_per_chunk" type="number" min="1" max="6" value="2"></label>
+          <label>Image workers <input name="image_workers" type="number" min="1" max="16" value="1"></label>
+        </div>
+        <div class="hint">For Zhipu, keep image workers at 1 to avoid HTTP 429 rate limits. Increase only if your quota allows it.</div>
         <div class="row">
           <label>Width <input name="width" type="number" value="1920"></label>
           <label>Height <input name="height" type="number" value="1080"></label>
@@ -412,14 +559,16 @@ _HTML = r"""<!doctype html>
         <div class="row">
           <label>Image provider
             <select name="image_provider">
-              <option value="baidu" selected>baidu</option>
+              <option value="zhipu" selected>zhipu</option>
+              <option value="siliconflow">siliconflow</option>
+              <option value="baidu">baidu</option>
               <option value="pixabay">pixabay</option>
               <option value="openverse">openverse</option>
               <option value="wikimedia">wikimedia</option>
               <option value="fixture">fixture</option>
             </select>
           </label>
-          <label>Image workers <input name="image_workers" type="number" min="1" max="16" value="6"></label>
+          <label>Image model <input name="image_model" value="glm-image"></label>
         </div>
 
         <div class="row">
@@ -461,6 +610,8 @@ _HTML = r"""<!doctype html>
     const chunksEl = document.querySelector("#chunks");
     const prepareButton = document.querySelector("#prepare");
     const composeButton = document.querySelector("#compose");
+    window.manualSelections = {};
+    window.canCompose = false;
 
     function formPayload() {
       const data = new FormData(form);
@@ -486,8 +637,18 @@ _HTML = r"""<!doctype html>
       return data;
     }
 
-    function renderProject(project) {
+    async function getJson(url) {
+      const response = await fetch(url);
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `Request failed: ${response.status}`);
+      }
+      return data;
+    }
+
+    function renderProject(project, canCompose = false) {
       window.currentProject = project;
+      window.canCompose = canCompose;
       chunksEl.innerHTML = "";
       for (const chunk of project.chunks) {
         const section = document.createElement("section");
@@ -505,8 +666,18 @@ _HTML = r"""<!doctype html>
         subtitle.textContent = chunk.subtitle_text;
         section.appendChild(subtitle);
 
+        const chunkActions = document.createElement("div");
+        chunkActions.className = "chunk-actions";
+        const manualButton = document.createElement("button");
+        manualButton.type = "button";
+        manualButton.textContent = "Choose Local Image";
+        manualButton.addEventListener("click", () => chooseLocalImage(chunk.index));
+        chunkActions.appendChild(manualButton);
+        section.appendChild(chunkActions);
+
         const cards = document.createElement("div");
         cards.className = "cards";
+        const preferredSelection = String(window.manualSelections[chunk.index] || "");
         for (const candidate of chunk.image_candidates) {
           const card = document.createElement("label");
           card.className = "candidate";
@@ -516,7 +687,9 @@ _HTML = r"""<!doctype html>
           radio.name = `chunk-${chunk.index}`;
           radio.value = candidate.candidate_index;
           radio.disabled = !candidate.asset;
-          if (candidate.asset && !cards.querySelector("input:checked")) {
+          if (candidate.asset && preferredSelection && preferredSelection === String(candidate.candidate_index)) {
+            radio.checked = true;
+          } else if (candidate.asset && !preferredSelection && !cards.querySelector("input:checked")) {
             radio.checked = true;
           }
           card.appendChild(radio);
@@ -529,7 +702,7 @@ _HTML = r"""<!doctype html>
           } else {
             const error = document.createElement("div");
             error.className = "error";
-            error.textContent = candidate.error || "Image download failed.";
+            error.textContent = candidate.error === "pending" ? "Generating image..." : (candidate.error || "Image generation failed.");
             card.appendChild(error);
           }
 
@@ -542,7 +715,43 @@ _HTML = r"""<!doctype html>
         section.appendChild(cards);
         chunksEl.appendChild(section);
       }
-      composeButton.disabled = false;
+      composeButton.disabled = !canCompose;
+    }
+
+    async function chooseLocalImage(chunkIndex) {
+      if (!window.currentProject) {
+        statusEl.textContent = "Prepare a project before choosing local images.";
+        return;
+      }
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.addEventListener("change", async () => {
+        if (!input.files || !input.files[0]) {
+          return;
+        }
+        try {
+          statusEl.textContent = `Uploading local image for chunk ${chunkIndex}...`;
+          const data = new FormData();
+          data.append("output_dir", formPayload().output_dir);
+          data.append("chunk_index", String(chunkIndex));
+          data.append("image", input.files[0]);
+          const response = await fetch("/api/manual-image", {
+            method: "POST",
+            body: data
+          });
+          const result = await response.json();
+          if (!response.ok || result.error) {
+            throw new Error(result.error || `Upload failed: ${response.status}`);
+          }
+          window.manualSelections[chunkIndex] = result.candidate.candidate_index;
+          renderProject(result.project, window.canCompose);
+          statusEl.textContent = `Local image selected for chunk ${chunkIndex}.`;
+        } catch (error) {
+          statusEl.textContent = error.message;
+        }
+      });
+      input.click();
     }
 
     function selectedCandidates() {
@@ -560,14 +769,32 @@ _HTML = r"""<!doctype html>
       try {
         window.currentProject = null;
         composeButton.disabled = true;
-        setBusy(true, "Preparing story, translating, generating prompts, and downloading image candidates...");
-        const project = await postJson("/api/prepare", formPayload());
-        renderProject(project);
-        setBusy(false, `Prepared ${project.chunks.length} chunks. Pick one image per chunk, then compose.`);
+        setBusy(true, "Preparing story, translating, generating detailed Chinese prompts, and starting image generation...");
+        chunksEl.textContent = "Waiting for prompt plan...";
+        const job = await postJson("/api/prepare", formPayload());
+        await pollPrepareJob(job.job_id);
       } catch (error) {
         setBusy(false, error.message);
       }
     });
+
+    async function pollPrepareJob(jobId) {
+      while (true) {
+        const job = await getJson(`/api/job?job_id=${encodeURIComponent(jobId)}`);
+        if (job.project) {
+          renderProject(job.project, job.status === "complete");
+        }
+        if (job.status === "complete") {
+          setBusy(false, `Prepared ${job.project.chunks.length} chunks. Pick one image per chunk, then compose.`);
+          return;
+        }
+        if (job.status === "failed") {
+          throw new Error(job.error || "Prepare failed.");
+        }
+        statusEl.textContent = job.message || "Generating image candidates...";
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    }
 
     composeButton.addEventListener("click", async () => {
       try {

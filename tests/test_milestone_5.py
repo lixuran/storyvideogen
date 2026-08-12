@@ -31,6 +31,8 @@ class MilestoneFiveE2ETest(unittest.TestCase):
                     "5",
                     "--translator",
                     "mock",
+                    "--prompt-provider",
+                    "heuristic",
                     "--image-provider",
                     "fixture",
                     "--tts-provider",
@@ -75,4 +77,3 @@ class MilestoneFiveE2ETest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

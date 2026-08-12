@@ -31,6 +31,8 @@ class MilestoneTwoE2ETest(unittest.TestCase):
                     "90",
                     "--translator",
                     "mock",
+                    "--prompt-provider",
+                    "heuristic",
                     "--dry-run",
                 ],
                 cwd=root,

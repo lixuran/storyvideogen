@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .attribution import write_attribution_files
 from .beat_splitter import retime_chunks, split_into_chunks
 from .image_search.base import ImageProvider
 from .image_search.providers import build_image_provider
 from .models import GenerationPlan, ImageAsset, Story, StoryChunk
-from .pipeline import _build_narration_text
+from .pipeline import _build_narration_text, _chunk_max_words
 from .prompt_generator import build_prompt_provider, generate_prompt_candidates
 from .render.ffmpeg_renderer import render_video
 from .render.srt_writer import write_srt
 from .story_loader import select_target_excerpt
 from .subtitle_translator import build_translator, translate_chunks
 from .tts.providers import build_tts_provider
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 
 @dataclass(frozen=True)
@@ -28,13 +33,15 @@ class InteractiveSettings:
     width: int = 1920
     height: int = 1080
     words_per_minute: int = 145
+    chunk_seconds: int = 30
     translator: str = "zai"
     translation_model: str = "glm-5.2"
     prompt_provider: str = "zai"
     prompt_model: str = "glm-5.2"
-    image_provider: str = "baidu"
-    image_workers: int = 6
-    candidates_per_chunk: int = 3
+    image_provider: str = "zhipu"
+    image_model: str = "glm-image"
+    image_workers: int = 1
+    candidates_per_chunk: int = 2
     tts_provider: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"
     source_url: str | None = None
@@ -46,7 +53,10 @@ class InteractiveSettings:
         return max(1, round(self.target_seconds * self.words_per_minute / 60))
 
 
-def prepare_interactive_project(settings: InteractiveSettings) -> dict[str, object]:
+def prepare_interactive_project(
+    settings: InteractiveSettings,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, object]:
     story_text = settings.story_text.strip()
     title = settings.title.strip()
     if not story_text:
@@ -62,12 +72,18 @@ def prepare_interactive_project(settings: InteractiveSettings) -> dict[str, obje
         license_name=settings.story_license,
     )
     excerpt = select_target_excerpt(story.text, settings.target_words)
-    chunks = split_into_chunks(excerpt, settings.target_seconds, settings.words_per_minute)
+    chunks = split_into_chunks(
+        excerpt,
+        settings.target_seconds,
+        settings.words_per_minute,
+        max_words=_chunk_max_words(settings.words_per_minute, settings.chunk_seconds),
+    )
     translated_chunks = translate_chunks(chunks, build_translator(settings.translator, settings.translation_model))
     prompt_groups = generate_prompt_candidates(
         translated_chunks,
         build_prompt_provider(settings.prompt_provider, settings.prompt_model),
         settings.candidates_per_chunk,
+        story_context=excerpt,
     )
 
     settings.output_dir.mkdir(parents=True, exist_ok=True)
@@ -76,12 +92,18 @@ def prepare_interactive_project(settings: InteractiveSettings) -> dict[str, obje
     (settings.output_dir / "narration.zh-CN.txt").write_text(_build_narration_text(translated_chunks) + "\n", encoding="utf-8")
     write_srt(settings.output_dir / "subtitles.zh-CN.srt", translated_chunks)
 
+    pending_candidates = _pending_image_candidates(translated_chunks, prompt_groups)
+    pending_project = _project_manifest(settings, story, excerpt, translated_chunks, prompt_groups, pending_candidates)
+    if progress_callback:
+        progress_callback({"type": "project", "project": pending_project})
+
     candidates = _fetch_image_candidates(
         translated_chunks,
         prompt_groups,
-        build_image_provider(settings.image_provider),
+        build_image_provider(settings.image_provider, settings.image_model),
         settings.output_dir,
         max_workers=settings.image_workers,
+        progress_callback=progress_callback,
     )
     project = _project_manifest(settings, story, excerpt, translated_chunks, prompt_groups, candidates)
     _write_json(settings.output_dir / "interactive_project.json", project)
@@ -180,12 +202,56 @@ def compose_interactive_project(
     }
 
 
+def add_manual_image_candidate(output_dir: Path, chunk_index: int, source_path: Path) -> dict[str, object]:
+    project_path = output_dir / "interactive_project.json"
+    if not project_path.is_file():
+        raise FileNotFoundError(f"Interactive project does not exist: {project_path}")
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Manual image file does not exist: {source_path}")
+    if not _is_supported_image(source_path):
+        raise ValueError(f"Manual image must be a supported image file: {source_path}")
+
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    chunk = _chunk_by_index(project["chunks"], chunk_index)
+    manual_dir = output_dir / "manual_images"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    candidate_index = _next_candidate_index(chunk)
+    target_path = manual_dir / f"chunk_{chunk_index:03}_manual_{candidate_index:03}{source_path.suffix.lower()}"
+    shutil.copyfile(source_path, target_path)
+
+    candidate = {
+        "chunk_index": chunk_index,
+        "candidate_index": candidate_index,
+        "prompt": f"manual image: {source_path.name}",
+        "asset": {
+            "index": chunk_index,
+            "prompt": f"manual image: {source_path.name}",
+            "local_path": str(target_path),
+            "source_url": str(source_path),
+            "creator": "manual upload",
+            "license_name": "user-provided",
+            "license_url": "",
+            "provider": "manual",
+            "title": source_path.name,
+            "width": None,
+            "height": None,
+        },
+        "error": "",
+    }
+    chunk["image_candidates"].append(candidate)
+    _write_json(project_path, project)
+    _write_json(output_dir / "image_candidates_manifest.json", [chunk["image_candidates"] for chunk in project["chunks"]])
+    _write_json(output_dir / "prompts.json", project["chunks"])
+    return {"project": project, "candidate": candidate}
+
+
 def _fetch_image_candidates(
     chunks: list[StoryChunk],
     prompt_groups: list[list[str]],
     provider: ImageProvider,
     output_dir: Path,
     max_workers: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[list[dict[str, object]]]:
     image_dir = output_dir / "image_candidates"
     tasks: dict[object, tuple[int, int, str]] = {}
@@ -218,11 +284,32 @@ def _fetch_image_candidates(
                     "asset": None,
                     "error": str(exc),
                 }
+            if progress_callback:
+                progress_callback({"type": "candidate", "candidate": results[(chunk_index, candidate_index)]})
 
     grouped: list[list[dict[str, object]]] = []
     for chunk, prompts in zip(chunks, prompt_groups):
         grouped.append([results[(chunk.index, index)] for index in range(1, len(prompts) + 1)])
     return grouped
+
+
+def _pending_image_candidates(
+    chunks: list[StoryChunk],
+    prompt_groups: list[list[str]],
+) -> list[list[dict[str, object]]]:
+    return [
+        [
+            {
+                "chunk_index": chunk.index,
+                "candidate_index": candidate_index,
+                "prompt": prompt,
+                "asset": None,
+                "error": "pending",
+            }
+            for candidate_index, prompt in enumerate(prompts, start=1)
+        ]
+        for chunk, prompts in zip(chunks, prompt_groups)
+    ]
 
 
 def _project_manifest(
@@ -248,11 +335,13 @@ def _project_manifest(
             "width": settings.width,
             "height": settings.height,
             "words_per_minute": settings.words_per_minute,
+            "chunk_seconds": settings.chunk_seconds,
             "translator": settings.translator,
             "translation_model": settings.translation_model,
             "prompt_provider": settings.prompt_provider,
             "prompt_model": settings.prompt_model,
             "image_provider": settings.image_provider,
+            "image_model": settings.image_model,
             "image_workers": settings.image_workers,
             "candidates_per_chunk": settings.candidates_per_chunk,
             "tts_provider": settings.tts_provider,
@@ -309,6 +398,27 @@ def _candidate_by_index(chunk: dict[str, object], candidate_index: int) -> dict[
         if isinstance(candidate, dict) and int(candidate["candidate_index"]) == candidate_index:
             return candidate
     raise LookupError(f"Unknown image candidate {candidate_index} for chunk {chunk['index']}.")
+
+
+def _chunk_by_index(chunks: list[dict[str, object]], chunk_index: int) -> dict[str, object]:
+    for chunk in chunks:
+        if int(chunk["index"]) == chunk_index:
+            return chunk
+    raise LookupError(f"Unknown chunk index: {chunk_index}")
+
+
+def _next_candidate_index(chunk: dict[str, object]) -> int:
+    indexes = [
+        int(candidate["candidate_index"])
+        for candidate in chunk.get("image_candidates", [])
+        if isinstance(candidate, dict) and "candidate_index" in candidate
+    ]
+    return max(indexes, default=0) + 1
+
+
+def _is_supported_image(path: Path) -> bool:
+    content_type = mimetypes.guess_type(path.name)[0] or ""
+    return content_type.startswith("image/")
 
 
 def _image_asset_from_json(data: dict[str, object], index: int) -> ImageAsset:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from storyvideogen.interactive_workflow import (
     InteractiveSettings,
+    add_manual_image_candidate,
     compose_interactive_project,
     prepare_interactive_project,
 )
@@ -17,6 +18,7 @@ class InteractiveWorkflowTest(unittest.TestCase):
     def test_prepare_downloads_multiple_image_candidates_per_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir) / "project"
+            events = []
             project = prepare_interactive_project(
                 InteractiveSettings(
                     story_text="The locked door waited. The concrete statue watched.",
@@ -27,11 +29,14 @@ class InteractiveWorkflowTest(unittest.TestCase):
                     prompt_provider="heuristic",
                     image_provider="fixture",
                     candidates_per_chunk=2,
-                )
+                ),
+                progress_callback=events.append,
             )
 
             self.assertTrue((out_dir / "interactive_project.json").exists())
             self.assertTrue((out_dir / "image_candidates_manifest.json").exists())
+            self.assertTrue(any(event["type"] == "project" for event in events))
+            self.assertTrue(any(event["type"] == "candidate" for event in events))
             self.assertGreaterEqual(len(project["chunks"]), 1)
             for chunk in project["chunks"]:
                 self.assertEqual(len(chunk["image_candidates"]), 2)
@@ -73,6 +78,31 @@ class InteractiveWorkflowTest(unittest.TestCase):
             self.assertTrue((out_dir / "video_manifest.json").exists())
             image_manifest = json.loads((out_dir / "image_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(len(image_manifest), len(project["chunks"]))
+
+    def test_add_manual_image_candidate_persists_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_image = root / "desk_image.jpg"
+            source_image.write_bytes(b"fake image")
+            out_dir = root / "project"
+            prepare_interactive_project(
+                InteractiveSettings(
+                    story_text="The locked door waited.",
+                    title="Manual Image Test",
+                    output_dir=out_dir,
+                    target_seconds=4,
+                    translator="mock",
+                    prompt_provider="heuristic",
+                    image_provider="fixture",
+                    candidates_per_chunk=1,
+                )
+            )
+
+            result = add_manual_image_candidate(out_dir, 1, source_image)
+            candidate = result["candidate"]
+
+            self.assertEqual(candidate["asset"]["provider"], "manual")
+            self.assertTrue(Path(candidate["asset"]["local_path"]).exists())
 
 
 if __name__ == "__main__":

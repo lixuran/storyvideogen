@@ -31,6 +31,8 @@ class MilestoneThreeE2ETest(unittest.TestCase):
                     "5",
                     "--translator",
                     "mock",
+                    "--prompt-provider",
+                    "heuristic",
                     "--image-provider",
                     "fixture",
                     "--tts-provider",

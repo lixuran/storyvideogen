@@ -29,6 +29,8 @@ class MilestoneOneE2ETest(unittest.TestCase):
                     str(out_dir),
                     "--translator",
                     "mock",
+                    "--prompt-provider",
+                    "heuristic",
                     "--dry-run",
                 ],
                 cwd=root,

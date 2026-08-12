@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 from storyvideogen.media import probe_duration, require_executable
@@ -34,89 +35,31 @@ def render_video(
     image_total_duration = max(1.0, audio.duration_seconds - title_duration)
     image_durations = _image_durations(images, image_total_duration)
 
-    command = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "lavfi",
-        "-t",
-        f"{title_duration:.3f}",
-        "-i",
-        f"color=c=0x101014:s={width}x{height}:r={fps}",
-    ]
-    for image in images:
-        command.extend(["-i", str(image.local_path.resolve())])
-    command.extend(["-i", str(audio.local_path.resolve())])
-    if background_music is not None:
-        command.extend(["-stream_loop", "-1", "-i", str(background_music.resolve())])
-
-    filter_parts = [
-        (
-            f"[0:v]drawtext=textfile=title_card.txt:fontcolor=white:fontsize=72:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2,format=yuv420p[v0]"
-        )
-    ]
-    concat_inputs = ["[v0]"]
-    for position, duration in enumerate(image_durations, start=1):
-        frames = max(1, round(duration * fps))
-        filter_parts.append(
-            (
-                f"[{position}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},zoompan=z='min(zoom+0.0007,1.08)':"
-                f"d={frames}:s={width}x{height}:fps={fps},setpts=PTS-STARTPTS,"
-                f"setsar=1,format=yuv420p[v{position}]"
-            )
-        )
-        concat_inputs.append(f"[v{position}]")
-
-    filter_parts.append(f"{''.join(concat_inputs)}concat=n={len(concat_inputs)}:v=1:a=0[v]")
-    audio_index = len(images) + 1
-    audio_map = f"{audio_index}:a"
-    if background_music is not None:
-        music_index = audio_index + 1
-        safe_volume = max(0.0, min(music_volume, 1.0))
-        filter_parts.extend(
-            [
-                f"[{audio_index}:a]asetpts=PTS-STARTPTS[narration]",
-                (
-                    f"[{music_index}:a]volume={safe_volume:.3f},"
-                    f"atrim=0:{audio.duration_seconds:.3f},asetpts=PTS-STARTPTS[music]"
-                ),
-                "[narration][music]amix=inputs=2:duration=first:dropout_transition=0[a]",
-            ]
-        )
-        audio_map = "[a]"
-
-    command.extend(
-        [
-            "-filter_complex",
-            ";".join(filter_parts),
-            "-map",
-            "[v]",
-            "-map",
-            audio_map,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(video_path),
+    with tempfile.TemporaryDirectory(prefix="storyvideogen_segments_", dir=output_dir) as temp_name:
+        temp_dir = Path(temp_name)
+        segments = [
+            _render_title_segment(title_file, temp_dir / "segment_000.mp4", title_duration, width, height, fps)
         ]
-    )
+        for position, (image, duration) in enumerate(zip(images, image_durations), start=1):
+            segments.append(
+                _render_image_segment(
+                    image.local_path,
+                    temp_dir / f"segment_{position:03}.mp4",
+                    duration,
+                    width,
+                    height,
+                    fps,
+                )
+            )
 
-    result = subprocess.run(
-        command,
-        cwd=output_dir,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed to render video: {result.stderr.strip()}")
+        video_only_path = _concat_segments(segments, temp_dir / "video_only.mp4")
+        _mux_audio(
+            video_only_path,
+            audio,
+            video_path,
+            background_music=background_music,
+            music_volume=music_volume,
+        )
 
     return VideoAsset(
         local_path=video_path,
@@ -124,6 +67,173 @@ def render_video(
         width=width,
         height=height,
     )
+
+
+def _render_title_segment(
+    title_file: Path,
+    output_path: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+) -> Path:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        f"color=c=0x101014:s={width}x{height}:r={fps}",
+        "-vf",
+        (
+            "drawtext=textfile=title_card.txt:fontcolor=white:fontsize=72:"
+            f"x=(w-text_w)/2:y=(h-text_h)/2,setsar=1,format=yuv420p"
+        ),
+        "-r",
+        str(fps),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        str(output_path),
+    ]
+    _run_ffmpeg(command, "render title segment", cwd=title_file.parent)
+    return output_path
+
+
+def _render_image_segment(
+    image_path: Path,
+    output_path: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+) -> Path:
+    frames = max(1, round(duration * fps))
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(image_path.resolve()),
+        "-vf",
+        (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},zoompan=z='min(zoom+0.0007,1.08)':"
+            f"d={frames}:s={width}x{height}:fps={fps},setpts=N/({fps}*TB),"
+            f"setsar=1,format=yuv420p"
+        ),
+        "-frames:v",
+        str(frames),
+        "-r",
+        str(fps),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        str(output_path),
+    ]
+    _run_ffmpeg(command, f"render image segment {image_path.name}")
+    return output_path
+
+
+def _concat_segments(segments: list[Path], output_path: Path) -> Path:
+    concat_file = output_path.with_name("concat.txt")
+    concat_file.write_text(
+        "".join(f"file '{_concat_file_path(segment)}'\n" for segment in segments),
+        encoding="utf-8",
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_file),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    _run_ffmpeg(command, "concatenate video segments")
+    return output_path
+
+
+def _mux_audio(
+    video_only_path: Path,
+    audio: AudioAsset,
+    output_path: Path,
+    background_music: Path | None,
+    music_volume: float,
+) -> None:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_only_path.resolve()),
+        "-i",
+        str(audio.local_path.resolve()),
+    ]
+    audio_map = "1:a"
+    if background_music is not None:
+        safe_volume = max(0.0, min(music_volume, 1.0))
+        command.extend(["-stream_loop", "-1", "-i", str(background_music.resolve())])
+        command.extend(
+            [
+                "-filter_complex",
+                (
+                    "[1:a]asetpts=PTS-STARTPTS[narration];"
+                    f"[2:a]volume={safe_volume:.3f},"
+                    f"atrim=0:{audio.duration_seconds:.3f},asetpts=PTS-STARTPTS[music];"
+                    "[narration][music]amix=inputs=2:duration=first:dropout_transition=0[a]"
+                ),
+            ]
+        )
+        audio_map = "[a]"
+
+    command.extend(
+        [
+            "-map",
+            "0:v",
+            "-map",
+            audio_map,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_path),
+        ]
+    )
+    _run_ffmpeg(command, "mux narration and background music")
+
+
+def _run_ffmpeg(command: list[str], stage: str, cwd: Path | None = None) -> None:
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to {stage}: {result.stderr.strip()}")
+
+
+def _concat_file_path(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
 
 
 def _title_duration(audio_seconds: float) -> float:
