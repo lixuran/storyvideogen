@@ -12,3 +12,4 @@ build/
 node_modules/
 playwright-report/
 test-results/
+deploy/docker/storyvideogen.env

@@ -1,0 +1,61 @@
+name: storyvideogen
+
+x-application: &application
+  image: storyvideogen:local
+  build:
+    context: .
+  restart: unless-stopped
+  env_file:
+    - ${STORYVIDEOGEN_ENV_FILE:-deploy/docker/storyvideogen.env}
+  volumes:
+    - ./output:/app/output
+  networks:
+    - private
+
+services:
+  api:
+    <<: *application
+    command: ["node", "server/dist/index.js"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    <<: *application
+    command: ["node", "server/dist/worker.js"]
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 2m
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in deploy/docker/storyvideogen.env}
+      STORYVIDEOGEN_DOMAIN: ${STORYVIDEOGEN_DOMAIN:?Set STORYVIDEOGEN_DOMAIN in deploy/docker/storyvideogen.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - private
+
+networks:
+  private:
+
+volumes:
+  caddy_data:
+  caddy_config:

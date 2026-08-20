@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+node_modules
+output
+playwright-report
+test-results
+server/dist
+web/dist
+*.egg-info
+__pycache__
+*.py[cod]
+deploy/docker/storyvideogen.env

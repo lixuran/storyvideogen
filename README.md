@@ -99,6 +99,60 @@ Deployment files:
 - `deploy/storyvideogen.env.example`
 - `deploy/storyvideogen-healthcheck.sh`
 
+### Docker Compose deployment
+
+Use Docker Compose on hosts that do not package Python 3.12 or an FFmpeg build
+with libass, including the standard Alibaba Cloud Linux 3 image. The production
+image pins Node 24 and Python 3.12, verifies the FFmpeg `subtitles` filter and
+Noto CJK font during the build, and runs the API and one worker as an unprivileged
+UID 10001. Caddy is the only public container; the API is also bound to host
+loopback for health checks and SSH-tunnel testing.
+
+```bash
+git clone --branch codex/podcast-platform-redesign https://github.com/lixuran/storyvideogen.git /opt/storyvideogen
+cd /opt/storyvideogen
+cp deploy/docker/storyvideogen.env.example deploy/docker/storyvideogen.env
+chmod 600 deploy/docker/storyvideogen.env
+mkdir -p output
+sudo chown 10001:10001 output
+```
+
+Generate the secret master key with `openssl rand -base64 32`, then edit
+`deploy/docker/storyvideogen.env`. Keep payment mode disabled until the real
+WeChat adapter and merchant configuration are accepted. The environment file is
+ignored by both Git and the Docker build context.
+
+Build and inspect the bundled runtimes before starting:
+
+```bash
+docker compose --env-file deploy/docker/storyvideogen.env build
+docker compose --env-file deploy/docker/storyvideogen.env run --rm api python --version
+docker compose --env-file deploy/docker/storyvideogen.env run --rm api ffmpeg -hide_banner -filters
+docker compose --env-file deploy/docker/storyvideogen.env up -d api worker
+curl --fail http://127.0.0.1:3000/health/ready
+```
+
+Until DNS and ICP filing are ready, leave Caddy stopped and reach the loopback
+API through an SSH tunnel. Set secure cookies to `false` only for that temporary
+HTTP test. For the public launch, set the real domain and email, restore secure
+cookies to `true`, point DNS to the VPS, open only ports 80/443, and start Caddy:
+
+```bash
+docker compose --env-file deploy/docker/storyvideogen.env up -d caddy
+docker compose --env-file deploy/docker/storyvideogen.env ps
+docker compose --env-file deploy/docker/storyvideogen.env logs --tail=100 api worker caddy
+```
+
+Bootstrap an administrator after registering that username in the browser:
+
+```bash
+docker compose --env-file deploy/docker/storyvideogen.env run --rm api npm run admin:bootstrap -- your-username
+```
+
+The bind-mounted `output/` directory contains the SQLite database and all media;
+back up that directory as one coordinated unit. Keep only one worker on a
+two-vCPU, two-GB host and add swap before the first render.
+
 Important public-test environment variables:
 
 ```bash
