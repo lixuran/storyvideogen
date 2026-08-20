@@ -1,0 +1,29 @@
+import {randomUUID} from "node:crypto";
+
+import type {SqliteDatabase} from "../db/database.js";
+import {runInTransaction} from "../db/transaction.js";
+
+export class BillingRepository {
+  constructor(private readonly database: SqliteDatabase) {}
+  seed(now: string): void {
+    const statement = this.database.prepare("INSERT INTO plans (code, display_name, price_fen, period_days, quota_json, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(code) DO UPDATE SET quota_json = excluded.quota_json, updated_at = excluded.updated_at WHERE plans.quota_json <> excluded.quota_json");
+    runInTransaction(this.database, () => {
+      for (const plan of planSeeds) statement.run(plan.code, plan.displayName, plan.priceFen, plan.periodDays, JSON.stringify(plan.quotas), plan.sortOrder, now, now);
+    });
+  }
+  ensureTrial(userId: string, now: string): void { const existing = this.database.prepare("SELECT id FROM subscriptions WHERE user_id = ? ORDER BY period_end DESC LIMIT 1").get(userId); if (existing) return; const end = new Date(Date.parse(now) + 7 * 86400000).toISOString(); this.database.prepare("INSERT INTO subscriptions (id, user_id, plan_code, state, period_start, period_end, created_at, updated_at) VALUES (?, ?, 'trial', 'active', ?, ?, ?, ?)").run(randomUUID(), userId, now, end, now, now); }
+  plans() { return this.database.prepare("SELECT code, display_name AS displayName, price_fen AS priceFen, period_days AS periodDays, quota_json AS quotaJson FROM plans WHERE is_active = 1 ORDER BY sort_order").all() as Array<{code: string; displayName: string; priceFen: number; periodDays: number; quotaJson: string}>; }
+  active(userId: string, now: string) { return this.database.prepare("SELECT subscriptions.*, plans.display_name, plans.quota_json FROM subscriptions JOIN plans ON plans.code = subscriptions.plan_code WHERE subscriptions.user_id = ? AND subscriptions.state = 'active' AND subscriptions.period_end > ? ORDER BY subscriptions.period_end DESC LIMIT 1").get(userId, now) as Record<string, unknown> | undefined; }
+  usage(userId: string, subscriptionId: string) { return this.database.prepare("SELECT unit_type AS unitType, SUM(quantity) AS quantity FROM usage_ledger WHERE user_id = ? AND subscription_id = ? GROUP BY unit_type").all(userId, subscriptionId) as Array<{unitType: string; quantity: number}>; }
+  orders(userId: string) { return this.database.prepare("SELECT id, plan_code AS planCode, amount_fen AS amountFen, state, code_url AS codeUrl, created_at AS createdAt, paid_at AS paidAt FROM payment_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(userId); }
+  createOrder(userId: string, planCode: string, amountFen: number, state: string, codeUrl: string, now: string) { const id = randomUUID(); this.database.prepare("INSERT INTO payment_orders (id, user_id, plan_code, merchant_order_no, amount_fen, state, code_url, code_url_expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(id, userId, planCode, `SV-${Date.now()}-${id.slice(0, 8)}`, amountFen, state, codeUrl, new Date(Date.parse(now) + 15 * 60000).toISOString(), now, now); return id; }
+  updateFakeOrder(userId: string, orderId: string, outcome: "paid" | "failed", now: string): boolean { return runInTransaction(this.database, () => { const order = this.database.prepare("SELECT * FROM payment_orders WHERE id = ? AND user_id = ?").get(orderId, userId) as Record<string, unknown> | undefined; if (!order) return false; if (order.state === outcome) return true; if (order.state !== "pending") return false; this.database.prepare("UPDATE payment_orders SET state = ?, updated_at = ?, paid_at = ? WHERE id = ?").run(outcome, now, outcome === "paid" ? now : null, orderId); if (outcome === "paid") this.extend(userId, String(order.plan_code), orderId, now); return true; }); }
+  addUsage(userId: string, subscriptionId: string, unitType: string, quantity: number, storyId: string | null, jobId: string): void { const exists = this.database.prepare("SELECT 1 FROM usage_ledger WHERE job_id = ? AND unit_type = ?").get(jobId, unitType); if (!exists) this.database.prepare("INSERT INTO usage_ledger (user_id, subscription_id, unit_type, quantity, story_id, job_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(userId, subscriptionId, unitType, quantity, storyId, jobId, new Date().toISOString()); }
+  databaseHandle(): SqliteDatabase { return this.database; }
+  private extend(userId: string, planCode: string, orderId: string, now: string): void { const plan = this.database.prepare("SELECT period_days FROM plans WHERE code = ?").get(planCode) as {period_days: number}; const current = this.database.prepare("SELECT * FROM subscriptions WHERE user_id = ? AND state = 'active' ORDER BY period_end DESC LIMIT 1").get(userId) as Record<string, unknown> | undefined; const start = current && current.plan_code === planCode && Date.parse(String(current.period_end)) > Date.parse(now) ? String(current.period_end) : now; if (current) this.database.prepare("UPDATE subscriptions SET state = 'expired', updated_at = ? WHERE id = ?").run(now, current.id); const end = new Date(Date.parse(start) + plan.period_days * 86400000).toISOString(); this.database.prepare("INSERT INTO subscriptions (id, user_id, plan_code, state, period_start, period_end, originating_order_id, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)").run(randomUUID(), userId, planCode, start, end, orderId, now, now); }
+}
+
+const planSeeds = [
+  {code: "trial", displayName: "Trial", priceFen: 0, periodDays: 7, quotas: {planning_jobs: 5, image_assets: 1_000, render_jobs: 2}, sortOrder: 0},
+  {code: "creator", displayName: "Creator", priceFen: 2_990, periodDays: 30, quotas: {planning_jobs: 100, image_assets: 1_000, render_jobs: 50}, sortOrder: 1}
+] as const;

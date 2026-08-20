@@ -15,6 +15,7 @@ from .image_search.providers import build_image_provider
 from .models import GenerationPlan, ImageAsset, Story, StoryChunk
 from .pipeline import _build_narration_text, _chunk_max_words
 from .prompt_generator import build_prompt_provider, generate_prompt_candidates
+from .provider_credentials import provider_credentials
 from .render.ffmpeg_renderer import render_video
 from .render.srt_writer import write_srt
 from .story_loader import select_target_excerpt
@@ -47,6 +48,7 @@ class InteractiveSettings:
     source_url: str | None = None
     author: str | None = None
     story_license: str | None = None
+    provider_credentials: dict[str, str] | None = None
 
     @property
     def target_words(self) -> int:
@@ -78,13 +80,14 @@ def prepare_interactive_project(
         settings.words_per_minute,
         max_words=_chunk_max_words(settings.words_per_minute, settings.chunk_seconds),
     )
-    translated_chunks = translate_chunks(chunks, build_translator(settings.translator, settings.translation_model))
-    prompt_groups = generate_prompt_candidates(
-        translated_chunks,
-        build_prompt_provider(settings.prompt_provider, settings.prompt_model),
-        settings.candidates_per_chunk,
-        story_context=excerpt,
-    )
+    with provider_credentials(settings.provider_credentials or {}):
+        translated_chunks = translate_chunks(chunks, build_translator(settings.translator, settings.translation_model))
+        prompt_groups = generate_prompt_candidates(
+            translated_chunks,
+            build_prompt_provider(settings.prompt_provider, settings.prompt_model),
+            settings.candidates_per_chunk,
+            story_context=excerpt,
+        )
 
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     (settings.output_dir / "story_input.txt").write_text(story.text + "\n", encoding="utf-8")
@@ -97,14 +100,15 @@ def prepare_interactive_project(
     if progress_callback:
         progress_callback({"type": "project", "project": pending_project})
 
-    candidates = _fetch_image_candidates(
-        translated_chunks,
-        prompt_groups,
-        build_image_provider(settings.image_provider, settings.image_model),
-        settings.output_dir,
-        max_workers=settings.image_workers,
-        progress_callback=progress_callback,
-    )
+    with provider_credentials(settings.provider_credentials or {}):
+        candidates = _fetch_image_candidates(
+            translated_chunks,
+            prompt_groups,
+            build_image_provider(settings.image_provider, settings.image_model),
+            settings.output_dir,
+            max_workers=settings.image_workers,
+            progress_callback=progress_callback,
+        )
     project = _project_manifest(settings, story, excerpt, translated_chunks, prompt_groups, candidates)
     _write_json(settings.output_dir / "interactive_project.json", project)
     _write_json(settings.output_dir / "image_candidates_manifest.json", candidates)

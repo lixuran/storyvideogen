@@ -52,6 +52,7 @@ def write_story_session(
     job_id: object | None = None,
     error: object | None = None,
     video_path: object | None = None,
+    settings: dict[str, object] | None = None,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     session = _read_session(output_dir) or _new_session(output_dir)
@@ -64,6 +65,7 @@ def write_story_session(
         "job_id": str(job_id) if job_id is not None else None,
         "error": str(error) if error is not None else None,
         "video_path": str(video_path) if video_path is not None else None,
+        "settings": settings,
     }
     for key, value in updates.items():
         if value is not None:
@@ -127,8 +129,11 @@ def story_summary(output_dir: Path, active_job: dict[str, object] | None = None)
         session["message"] = str(active_job.get("message") or session.get("message") or "")
         session["error"] = str(active_job.get("error") or "")
         job_status = str(active_job.get("status") or "")
-        if job_status == "running":
-            session["status"] = "preparing"
+        if job_status == "queued":
+            session["status"] = "queued"
+        elif job_status == "running":
+            message = str(active_job.get("message") or "")
+            session["status"] = "composing" if "Composing" in message or "compose" in message.lower() else "preparing"
         elif job_status == "failed":
             session["status"] = "failed"
         elif job_status == "complete" and session.get("status") != "composed":

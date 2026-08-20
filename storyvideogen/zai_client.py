@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
+from .provider_credentials import credential_value
 
 
 def get_zai_api_key() -> str:
-    api_key = os.environ.get("ZAI_API_KEY") or os.environ.get("ZHIPUAI_API_KEY")
+    api_key = credential_value("ZAI_API_KEY", "ZHIPUAI_API_KEY")
     if not api_key:
         raise RuntimeError("ZAI_API_KEY is required for ZAI-powered generation.")
     return api_key

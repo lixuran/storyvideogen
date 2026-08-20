@@ -69,6 +69,17 @@ def render_video(
     )
 
 
+def render_scene_video(images: list[ImageAsset], durations: list[float], audio: AudioAsset, output_dir: Path, width: int, height: int, background_music: Path | None = None, music_volume: float = 0.18, subtitle_path: Path | None = None) -> VideoAsset:
+    if not images or len(images) != len(durations) or any(duration <= 0 for duration in durations):
+        raise ValueError("Scene images and durations must be non-empty and aligned.")
+    if subtitle_path is not None and not subtitle_path.is_file():
+        raise FileNotFoundError(f"Subtitle file does not exist: {subtitle_path}")
+    require_executable("ffmpeg"); output_dir = output_dir.resolve(); output_dir.mkdir(parents=True, exist_ok=True); video_path = output_dir / "video.mp4"; fps = 30
+    with tempfile.TemporaryDirectory(prefix="storyvideogen_segments_", dir=output_dir) as temp_name:
+        temp_dir = Path(temp_name); segments = [_render_image_segment(image.local_path, temp_dir / f"segment_{position:03}.mp4", duration, width, height, fps) for position, (image, duration) in enumerate(zip(images, durations), start=1)]; video_only = _concat_segments(segments, temp_dir / "video_only.mp4"); _mux_audio(video_only, audio, video_path, background_music=background_music, music_volume=music_volume, subtitle_path=subtitle_path)
+    return VideoAsset(local_path=video_path, duration_seconds=probe_duration(video_path), width=width, height=height)
+
+
 def _render_title_segment(
     title_file: Path,
     output_path: Path,
@@ -177,6 +188,7 @@ def _mux_audio(
     output_path: Path,
     background_music: Path | None,
     music_volume: float,
+    subtitle_path: Path | None = None,
 ) -> None:
     command = [
         "ffmpeg",
@@ -203,21 +215,22 @@ def _mux_audio(
         )
         audio_map = "[a]"
 
-    command.extend(
-        [
-            "-map",
-            "0:v",
-            "-map",
-            audio_map,
+    command.extend(["-map", "0:v", "-map", audio_map])
+    if subtitle_path is None:
+        command.extend(["-c:v", "copy"])
+    else:
+        command.extend([
+            "-vf",
+            "subtitles=subtitles.zh-CN.srt:force_style='FontName=Noto Sans CJK SC,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=24,Alignment=2'",
             "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(output_path),
-        ]
-    )
-    _run_ffmpeg(command, "mux narration and background music")
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+    command.extend(["-c:a", "aac", "-shortest", str(output_path)])
+    _run_ffmpeg(command, "mux narration, subtitles, and background music", cwd=subtitle_path.parent if subtitle_path is not None else None)
 
 
 def _run_ffmpeg(command: list[str], stage: str, cwd: Path | None = None) -> None:

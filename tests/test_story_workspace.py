@@ -52,6 +52,26 @@ class StoryWorkspaceTest(unittest.TestCase):
             self.assertEqual(stories[0]["job_id"], "job-1")
             self.assertEqual(stories[0]["message"], "Generating image candidates...")
 
+    def test_list_stories_overlays_compose_job_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            story = create_story_session(workspace, "composing")
+
+            stories = list_stories(
+                workspace,
+                [
+                    {
+                        "job_id": "job-1",
+                        "output_dir": story["output_dir"],
+                        "status": "running",
+                        "message": "Composing final video...",
+                    }
+                ],
+            )
+
+            self.assertEqual(stories[0]["status"], "composing")
+            self.assertEqual(stories[0]["job_id"], "job-1")
+
     def test_load_story_payload_reads_persisted_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

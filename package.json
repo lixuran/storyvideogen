@@ -1,0 +1,41 @@
+{
+  "name": "storyvideogen-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "start": "node server/dist/index.js",
+    "start:worker": "node server/dist/worker.js",
+    "admin:bootstrap": "npm run build:server && node server/dist/admin-bootstrap.js",
+    "import:legacy": "npm run build:server && node server/dist/import-legacy.js",
+    "test:python": "node scripts/run-python.mjs -m unittest discover -s tests -v",
+    "test:unit": "npm run build:server && node --test server/dist/app.test.js server/dist/assets/assetService.test.js server/dist/auth/auth.test.js server/dist/billing/billingRepository.test.js server/dist/billing/wechatCrypto.test.js server/dist/db/database.test.js server/dist/jobs/jobRepository.test.js server/dist/security/secretCipher.test.js server/dist/stories/storyService.test.js scripts/run-python.test.mjs",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit && node --check web/src/main.js && node --check e2e/storyvideogen.spec.js && node --check e2e/app-shell.spec.js && node --check e2e/database-bootstrap.spec.js && node --check e2e/identity-settings.spec.js && node --check e2e/stories-library.spec.js && node --check e2e/durable-jobs.spec.js && node --check e2e/full-story-planning.spec.js && node --check e2e/image-candidates.spec.js && node --check e2e/render-episode.spec.js && node --check e2e/subscription.spec.js && node --check e2e/wechat-boundary.spec.js && node --check e2e/admin.spec.js && node --check e2e/legacy-import.spec.js && node --check e2e/release-hardening.spec.js && node --check e2e/auto-mode.spec.js && node --check e2e/live-zhipu-planning.spec.js && node --check e2e/live-zhipu-image.spec.js && node --check e2e/helpers/worker-process.js && node --check playwright.config.js && node --check vite.config.js && node --check scripts/run-python.mjs && node --check scripts/run-python.test.mjs && node --check scripts/run-playwright.mjs",
+    "test:e2e": "npm run build && node scripts/run-playwright.mjs --project=legacy-python --project=chromium-desktop",
+    "test:e2e:headed": "npm run build && node scripts/run-playwright.mjs --project=legacy-python --project=chromium-desktop --headed",
+    "test:e2e:live:zhipu": "npm run build && node scripts/run-playwright.mjs --project=live-zhipu",
+    "verify": "npm run typecheck && npm run test:unit && npm run test:python && npm run build && npm run test:e2e",
+    "verify:live:zhipu": "npm run test:e2e:live:zhipu"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2",
+    "vite": "^7.1.1"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/multipart": "^9.4.0",
+    "@fastify/static": "^10.1.3",
+    "better-sqlite3": "^13.0.3",
+    "fastify": "^5.12.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  }
+}

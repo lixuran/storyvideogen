@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from storyvideogen.image_search.download import download_image
 from storyvideogen.models import ImageAsset
+from storyvideogen.provider_credentials import credential_value
 
 
 class PixabayImageProvider:
     name = "pixabay"
 
     def __init__(self, api_key: str | None = None) -> None:
-        self.api_key = api_key or os.environ.get("PIXABAY_API_KEY")
+        self.api_key = api_key or credential_value("PIXABAY_API_KEY")
 
     def fetch_image(self, prompt: str, output_dir: Path, index: int) -> ImageAsset:
         if not self.api_key:

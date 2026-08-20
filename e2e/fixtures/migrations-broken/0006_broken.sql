@@ -1,0 +1,2 @@
+CREATE TABLE migration_will_rollback (id TEXT PRIMARY KEY) STRICT;
+THIS IS NOT VALID SQL;

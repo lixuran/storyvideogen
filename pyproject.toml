@@ -2,11 +2,10 @@
 name = "storyvideogen"
 version = "0.1.0"
 description = "Generate cozy-creepy short story videos from licensed story text."
-requires-python = ">=3.11"
-dependencies = []
+requires-python = ">=3.12,<3.13"
+dependencies = ["edge-tts>=7.0.0"]
 
 [project.optional-dependencies]
-edge-tts = ["edge-tts>=7.0.0"]
 zai = ["zai-sdk>=0.2.3"]
 
 [project.scripts]
@@ -15,3 +14,6 @@ storyvideogen = "storyvideogen.cli:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["storyvideogen*"]

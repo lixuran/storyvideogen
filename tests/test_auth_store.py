@@ -22,10 +22,12 @@ class AuthStoreTest(unittest.TestCase):
             user = store.register_user("Alice_01", "password123")
             authenticated = store.authenticate_user("alice_01", "password123")
             token = store.create_session(int(user["id"]))
+            csrf_token = store.csrf_token_for_session(token)
 
             self.assertEqual(user["username"], "alice_01")
             self.assertEqual(authenticated, user)
             self.assertEqual(store.user_for_session(token), user)
+            self.assertTrue(store.check_csrf_token(token, csrf_token or ""))
 
             store.delete_session(token)
             self.assertIsNone(store.user_for_session(token))
@@ -47,6 +49,54 @@ class AuthStoreTest(unittest.TestCase):
                 store.register_user("ab", "password123")
             with self.assertRaises(AuthError):
                 store.register_user("valid-user", "short")
+
+    def test_api_keys_are_persisted_without_exposing_values_in_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuthStore(Path(tmp) / "auth.sqlite3")
+            user = store.register_user("alice", "password123")
+            user_id = int(user["id"])
+
+            store.update_api_keys(user_id, {"ZAI_API_KEY": "zai-secret", "PIXABAY_API_KEY": "pixabay-secret"})
+
+            self.assertEqual(
+                store.provider_credentials(user_id),
+                {"ZAI_API_KEY": "zai-secret", "PIXABAY_API_KEY": "pixabay-secret"},
+            )
+            self.assertEqual(
+                store.account_settings(user_id),
+                {
+                    "api_keys": {
+                        "zai": True,
+                        "zhipu_image": False,
+                        "siliconflow": False,
+                        "pixabay": True,
+                    }
+                },
+            )
+
+            store.update_api_keys(user_id, {}, clear_names={"PIXABAY_API_KEY"})
+            self.assertNotIn("PIXABAY_API_KEY", store.provider_credentials(user_id))
+
+    def test_change_password_requires_current_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AuthStore(Path(tmp) / "auth.sqlite3")
+            user = store.register_user("alice", "password123")
+
+            with self.assertRaises(AuthError):
+                store.change_password(int(user["id"]), "wrong-password", "new-password123")
+
+            store.change_password(int(user["id"]), "password123", "new-password123")
+
+            self.assertIsNone(store.authenticate_user("alice", "password123"))
+            self.assertEqual(store.authenticate_user("alice", "new-password123"), user)
+
+    def test_custom_user_root_scopes_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_root = Path(tmp) / "users"
+            store = AuthStore(Path(tmp) / "auth.sqlite3", user_root=user_root)
+            user = store.register_user("alice", "password123")
+
+            self.assertEqual(store.workspace_for_user(user), user_root / "alice" / "stories")
 
 
 if __name__ == "__main__":

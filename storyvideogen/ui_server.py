@@ -4,7 +4,10 @@ import copy
 import cgi
 import json
 import mimetypes
+import os
+import queue
 import shutil
+import socket
 import threading
 import urllib.parse
 import uuid
@@ -19,6 +22,8 @@ from .interactive_workflow import (
     compose_interactive_project,
     prepare_interactive_project,
 )
+from .rate_limiter import InMemoryRateLimiter, RateLimit, RateLimitExceeded
+from .server_config import is_admin_user, load_server_config
 from .story_workspace import (
     DEFAULT_WORKSPACE,
     create_story_session,
@@ -26,13 +31,24 @@ from .story_workspace import (
     load_story_payload,
     write_story_session,
 )
+from .upload_validation import safe_upload_filename, validate_image_file, validate_upload_size
 
 _PREPARE_JOBS: dict[str, dict[str, object]] = {}
+_COMPOSE_JOBS: dict[str, dict[str, object]] = {}
 _PREPARE_LOCK = threading.Lock()
+_COMPOSE_LOCK = threading.Lock()
 _AUTH_STORE = AuthStore()
+_RATE_LIMITER = InMemoryRateLimiter()
+_CONFIG = load_server_config()
+_COMPOSE_QUEUE: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue()
+_COMPOSE_WORKERS_STARTED = False
+_COMPOSE_WORKERS_LOCK = threading.Lock()
+_STATIC_ROOT = Path(__file__).resolve().parent.parent / "web" / "dist"
+_E2E_TEST_MODE = os.environ.get("STORYVIDEOGEN_E2E_TEST_MODE") == "1"
 
 
 def serve_ui(host: str = "127.0.0.1", port: int = 7860) -> None:
+    _ensure_compose_workers()
     server = ThreadingHTTPServer((host, port), StoryVideoUIHandler)
     print(f"storyvideogen UI running at http://{host}:{port}")
     server.serve_forever()
@@ -44,20 +60,38 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
-            self._send_text(_HTML, "text/html; charset=utf-8")
+            self._serve_static_file(_STATIC_ROOT / "index.html")
+            return
+        if parsed.path.startswith("/assets/"):
+            self._serve_static_file(_STATIC_ROOT / parsed.path.lstrip("/"))
             return
         if parsed.path == "/api/me":
             self._serve_current_user()
+            return
+        if parsed.path == "/api/csrf":
+            if not self._require_user():
+                return
+            self._serve_csrf_token()
             return
         if parsed.path == "/api/asset":
             if not self._require_user():
                 return
             self._serve_asset(parsed.query)
             return
+        if parsed.path == "/api/download":
+            if not self._require_user():
+                return
+            self._serve_download(parsed.query)
+            return
         if parsed.path == "/api/job":
             if not self._require_user():
                 return
             self._serve_job(parsed.query)
+            return
+        if parsed.path == "/api/compose-job":
+            if not self._require_user():
+                return
+            self._serve_compose_job(parsed.query)
             return
         if parsed.path == "/api/stories":
             if not self._require_user():
@@ -68,6 +102,16 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             if not self._require_user():
                 return
             self._serve_story(parsed.query)
+            return
+        if parsed.path == "/api/account":
+            if not self._require_user():
+                return
+            self._serve_account()
+            return
+        if parsed.path == "/api/test/seed-story" and _E2E_TEST_MODE:
+            if not self._require_user():
+                return
+            self._serve_test_seed_story(parsed.query)
             return
         self.send_error(404, "Not found")
 
@@ -84,6 +128,8 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
                 return
             if not self._require_user():
                 return
+            if not self._require_csrf():
+                return
             if self.path == "/api/prepare":
                 self._handle_prepare()
                 return
@@ -96,7 +142,20 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             if self.path == "/api/stories":
                 self._handle_create_story()
                 return
+            if self.path == "/api/story/draft":
+                self._handle_save_draft()
+                return
+            if self.path == "/api/account/api-keys":
+                self._handle_update_api_keys()
+                return
+            if self.path == "/api/account/password":
+                self._handle_change_password()
+                return
             self.send_error(404, "Not found")
+        except RateLimitExceeded as exc:
+            self._send_json({"error": str(exc)}, status=429)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=400)
 
@@ -106,6 +165,8 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
     def _handle_prepare(self) -> None:
         payload = self._read_json()
         user = self._current_user()
+        _check_generation_allowed(user)
+        _AUTH_STORE.increment_daily_usage(int(user["id"]), "prepare", _CONFIG.max_prepare_jobs_per_day)
         settings = InteractiveSettings(
             story_text=str(payload.get("story_text") or ""),
             title=str(payload.get("title") or ""),
@@ -127,58 +188,93 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             source_url=_optional_text(payload.get("source_url")),
             author=_optional_text(payload.get("author")),
             story_license=_optional_text(payload.get("story_license")),
+            provider_credentials=_AUTH_STORE.provider_credentials(int(user["id"])),
         )
         job_id = _start_prepare_job(settings)
         self._send_json({"job_id": job_id})
 
     def _handle_compose(self) -> None:
         payload = self._read_json()
+        user = self._current_user()
+        _check_generation_allowed(user)
+        _AUTH_STORE.increment_daily_usage(int(user["id"]), "compose", _CONFIG.max_compose_jobs_per_day)
         selections = {
             int(chunk_index): int(candidate_index)
             for chunk_index, candidate_index in dict(payload.get("selections") or {}).items()
         }
-        background_music = _optional_path(payload.get("background_music"))
-        result = compose_interactive_project(
-            output_dir=_safe_user_output_dir(self._current_user(), payload.get("output_dir")),
+        output_dir = _safe_user_output_dir(user, payload.get("output_dir"))
+        job_id = _start_compose_job(
+            user=user,
+            output_dir=output_dir,
             selections=selections,
-            background_music=background_music,
+            background_music=_optional_path(payload.get("background_music")),
             music_volume=_float(payload.get("music_volume"), 0.18),
             tts_provider=str(payload.get("tts_provider") or "edge"),
             voice=str(payload.get("voice") or "zh-CN-XiaoxiaoNeural"),
         )
-        write_story_session(
-            _safe_user_output_dir(self._current_user(), payload.get("output_dir")),
-            status="composed",
-            message="Video composed.",
-            error="",
-            video_path=result.get("video_path"),
-        )
-        self._send_json(result)
+        self._send_json({"job_id": job_id})
 
     def _handle_create_story(self) -> None:
         payload = self._read_json()
-        workspace = _user_workspace(self._current_user())
+        user = self._current_user()
+        workspace = _user_workspace(user)
+        if not is_admin_user(user) and len(list_stories(workspace, _active_jobs_for_user(user))) >= _CONFIG.max_stories_per_user:
+            raise PermissionError("Story quota exceeded.")
         story = create_story_session(
             workspace,
             tag=payload.get("tag"),
             title=payload.get("title"),
             story_text=payload.get("story_text"),
         )
-        self._send_json({"story": story, "stories": list_stories(workspace, _active_prepare_jobs_for_user(self._current_user()))})
+        self._send_json({"story": story, "stories": list_stories(workspace, _active_jobs_for_user(self._current_user()))})
+
+    def _handle_save_draft(self) -> None:
+        payload = self._read_json()
+        user = self._current_user()
+        output_dir = _safe_user_output_dir(user, payload.get("output_dir"))
+        story = write_story_session(
+            output_dir,
+            title=str(payload.get("title") or output_dir.name),
+            story_text=str(payload.get("story_text") or ""),
+            settings=_draft_settings_from_payload(payload),
+            status="draft",
+            message="Draft saved.",
+            error="",
+        )
+        self._send_json({"story": story})
 
     def _handle_register(self) -> None:
+        self._check_rate_limit("register")
         payload = self._read_json()
         user = _AUTH_STORE.register_user(str(payload.get("username") or ""), str(payload.get("password") or ""))
         token = _AUTH_STORE.create_session(int(user["id"]))
-        self._send_json({"user": user, "workspace": str(_user_workspace(user))}, cookies=[_session_cookie(token)])
+        self._send_json(_session_payload(user, token), cookies=[_session_cookie(token)])
 
     def _handle_login(self) -> None:
+        self._check_rate_limit("login")
         payload = self._read_json()
         user = _AUTH_STORE.authenticate_user(str(payload.get("username") or ""), str(payload.get("password") or ""))
         if user is None:
             raise AuthError("Invalid username or password.")
         token = _AUTH_STORE.create_session(int(user["id"]))
-        self._send_json({"user": user, "workspace": str(_user_workspace(user))}, cookies=[_session_cookie(token)])
+        self._send_json(_session_payload(user, token), cookies=[_session_cookie(token)])
+
+    def _handle_update_api_keys(self) -> None:
+        payload = self._read_json()
+        user = self._current_user()
+        updates, clear_names = _api_key_updates_from_payload(payload)
+        _AUTH_STORE.update_api_keys(int(user["id"]), updates, clear_names)
+        self._send_json(_account_payload(user))
+
+    def _handle_change_password(self) -> None:
+        payload = self._read_json()
+        user = self._current_user()
+        _AUTH_STORE.change_password(
+            int(user["id"]),
+            str(payload.get("current_password") or ""),
+            str(payload.get("new_password") or ""),
+        )
+        self._send_json({"ok": True})
 
     def _handle_logout(self) -> None:
         token = self._cookie_value(SESSION_COOKIE_NAME)
@@ -186,6 +282,7 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": True}, cookies=[_clear_session_cookie()])
 
     def _handle_manual_image(self) -> None:
+        validate_upload_size(self.headers.get("Content-Length", "0"), _CONFIG.max_upload_bytes)
         form = cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
@@ -203,11 +300,14 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
 
         upload_dir = output_dir / "manual_uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
-        upload_path = upload_dir / Path(str(file_item.filename)).name
+        upload_path = upload_dir / f"{safe_upload_filename(file_item.filename)}.upload"
         with upload_path.open("wb") as target:
             shutil.copyfileobj(file_item.file, target)
+        suffix = validate_image_file(upload_path)
+        final_upload_path = upload_path.with_suffix(suffix)
+        upload_path.replace(final_upload_path)
 
-        result = add_manual_image_candidate(output_dir, chunk_index, upload_path)
+        result = add_manual_image_candidate(output_dir, chunk_index, final_upload_path)
         write_story_session(output_dir, status="prepared", message=f"Local image selected for chunk {chunk_index}.")
         self._send_json(result)
 
@@ -225,7 +325,7 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _serve_job(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
@@ -241,9 +341,23 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             return
         self._send_json(payload)
 
+    def _serve_compose_job(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        job_id = params.get("job_id", [""])[0]
+        with _COMPOSE_LOCK:
+            job = _COMPOSE_JOBS.get(job_id)
+            payload = copy.deepcopy(job) if job else None
+        if payload is None:
+            self._send_json({"error": "Unknown compose job."}, status=404)
+            return
+        if not _path_belongs_to_user(self._current_user(), Path(str(payload.get("output_dir") or ""))):
+            self._send_json({"error": "Unknown compose job."}, status=404)
+            return
+        self._send_json(payload)
+
     def _serve_stories(self, query: str) -> None:
         workspace = _user_workspace(self._current_user())
-        self._send_json({"stories": list_stories(workspace, _active_prepare_jobs_for_user(self._current_user()))})
+        self._send_json({"stories": list_stories(workspace, _active_jobs_for_user(self._current_user()))})
 
     def _serve_story(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
@@ -254,12 +368,69 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         output_dir = _safe_user_output_dir(self._current_user(), raw_output_dir)
         self._send_json(load_story_payload(output_dir, _active_prepare_job_for_output(output_dir)))
 
+    def _serve_account(self) -> None:
+        self._send_json(_account_payload(self._current_user()))
+
+    def _serve_test_seed_story(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        output_dir = _safe_user_output_dir(self._current_user(), params.get("output_dir", [""])[0])
+        state = params.get("state", ["prepared"])[0]
+        if state == "prepared":
+            _seed_prepared_project(output_dir)
+        elif state == "composed":
+            _seed_prepared_project(output_dir)
+            _seed_composed_project(output_dir)
+        else:
+            raise ValueError(f"Unsupported test seed state: {state}")
+        self._send_json(load_story_payload(output_dir, _active_prepare_job_for_output(output_dir)))
+
     def _serve_current_user(self) -> None:
         user = self._current_user()
         if user is None:
             self._send_json({"user": None, "workspace": str(DEFAULT_WORKSPACE)})
             return
-        self._send_json({"user": user, "workspace": str(_user_workspace(user))})
+        self._send_json(_session_payload(user, self._cookie_value(SESSION_COOKIE_NAME) or ""))
+
+    def _serve_csrf_token(self) -> None:
+        token = self._cookie_value(SESSION_COOKIE_NAME) or ""
+        self._send_json({"csrf_token": _AUTH_STORE.csrf_token_for_session(token) or ""})
+
+    def _serve_download(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        raw_path = params.get("path", [""])[0]
+        path = Path(raw_path)
+        if not path.is_file() or not _path_belongs_to_user(self._current_user(), path):
+            self.send_error(404, "Download not found")
+            return
+
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{_download_filename(path.name)}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self._write_body(body)
+
+    def _serve_static_file(self, path: Path) -> None:
+        if path.name == "index.html" and not path.is_file():
+            self._send_text(_HTML, "text/html; charset=utf-8")
+            return
+        try:
+            path.resolve().relative_to(_STATIC_ROOT.resolve())
+        except ValueError:
+            self.send_error(404, "Static asset not found")
+            return
+        if not path.is_file():
+            self.send_error(404, "Static asset not found")
+            return
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self._write_body(body)
 
     def _read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -279,7 +450,7 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         for cookie in cookies or []:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _send_text(self, text: str, content_type: str) -> None:
         body = text.encode("utf-8")
@@ -287,7 +458,13 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
+
+    def _write_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, socket.timeout):
+            return
 
     def _require_user(self) -> dict[str, object] | None:
         user = self._current_user()
@@ -295,6 +472,14 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Authentication required."}, status=401)
             return None
         return user
+
+    def _require_csrf(self) -> bool:
+        token = self._cookie_value(SESSION_COOKIE_NAME) or ""
+        csrf_token = self.headers.get("X-CSRF-Token", "")
+        if not _AUTH_STORE.check_csrf_token(token, csrf_token):
+            self._send_json({"error": "Invalid CSRF token."}, status=403)
+            return False
+        return True
 
     def _current_user(self) -> dict[str, object] | None:
         return _AUTH_STORE.user_for_session(self._cookie_value(SESSION_COOKIE_NAME) or "")
@@ -306,6 +491,16 @@ class StoryVideoUIHandler(BaseHTTPRequestHandler):
             if separator and key == name:
                 return urllib.parse.unquote(value)
         return None
+
+    def _check_rate_limit(self, action: str) -> None:
+        client = self.client_address[0] if self.client_address else "unknown"
+        if action == "login":
+            limit = RateLimit(_CONFIG.login_rate_limit, _CONFIG.login_rate_window_seconds)
+        elif action == "register":
+            limit = RateLimit(_CONFIG.register_rate_limit, _CONFIG.register_rate_window_seconds)
+        else:
+            limit = RateLimit(_CONFIG.generation_rate_limit, _CONFIG.generation_rate_window_seconds)
+        _RATE_LIMITER.check(f"{action}:{client}", limit)
 
 
 def _int(value: object, default: int) -> int:
@@ -330,6 +525,73 @@ def _optional_text(value: object) -> str | None:
 def _optional_path(value: object) -> Path | None:
     text = str(value or "").strip()
     return Path(text) if text else None
+
+
+def _download_filename(name: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in name)[:120] or "download"
+
+
+def _session_payload(user: dict[str, object], session_token: str) -> dict[str, object]:
+    return {
+        "user": user,
+        "workspace": str(_user_workspace(user)),
+        "csrf_token": _AUTH_STORE.csrf_token_for_session(session_token) or "",
+        "is_admin": is_admin_user(user),
+        "limits": {
+            "max_upload_bytes": _CONFIG.max_upload_bytes,
+            "max_stories_per_user": _CONFIG.max_stories_per_user,
+            "max_active_jobs_per_user": _CONFIG.max_active_jobs_per_user,
+            "max_prepare_jobs_per_day": _CONFIG.max_prepare_jobs_per_day,
+            "max_compose_jobs_per_day": _CONFIG.max_compose_jobs_per_day,
+        },
+    }
+
+
+def _account_payload(user: dict[str, object] | None) -> dict[str, object]:
+    if user is None:
+        raise AuthError("Login required.")
+    return _AUTH_STORE.account_settings(int(user["id"]))
+
+
+def _api_key_updates_from_payload(payload: dict[str, object]) -> tuple[dict[str, str], set[str]]:
+    field_to_name = {
+        "zai_api_key": "ZAI_API_KEY",
+        "zhipu_image_api_key": "ZHIPU_IMAGE_API_KEY",
+        "siliconflow_api_key": "SILICONFLOW_API_KEY",
+        "pixabay_api_key": "PIXABAY_API_KEY",
+    }
+    updates: dict[str, str] = {}
+    clear_names: set[str] = set()
+    for field, name in field_to_name.items():
+        value = str(payload.get(field) or "").strip()
+        if value:
+            updates[name] = value
+        if _truthy(payload.get(f"clear_{field}")):
+            clear_names.add(name)
+    return updates, clear_names
+
+
+def _draft_settings_from_payload(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "target_seconds": _int(payload.get("target_seconds"), 90),
+        "width": _int(payload.get("width"), 1920),
+        "height": _int(payload.get("height"), 1080),
+        "chunk_seconds": _int(payload.get("chunk_seconds"), 30),
+        "translator": str(payload.get("translator") or "zai"),
+        "translation_model": str(payload.get("translation_model") or "glm-5.2"),
+        "prompt_provider": str(payload.get("prompt_provider") or "zai"),
+        "prompt_model": str(payload.get("prompt_model") or "glm-5.2"),
+        "image_provider": str(payload.get("image_provider") or "zhipu"),
+        "image_model": str(payload.get("image_model") or "glm-image"),
+        "image_workers": _int(payload.get("image_workers"), 1),
+        "candidates_per_chunk": _int(payload.get("candidates_per_chunk"), 2),
+        "tts_provider": str(payload.get("tts_provider") or "edge"),
+        "voice": str(payload.get("voice") or "zh-CN-XiaoxiaoNeural"),
+    }
+
+
+def _truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _user_workspace(user: dict[str, object] | None) -> Path:
@@ -365,11 +627,118 @@ def _path_belongs_to_user(user: dict[str, object] | None, path: Path) -> bool:
 
 
 def _session_cookie(token: str) -> str:
-    return f"{SESSION_COOKIE_NAME}={urllib.parse.quote(token)}; Path=/; HttpOnly; SameSite=Lax"
+    secure = "; Secure" if _CONFIG.secure_cookies else ""
+    return f"{SESSION_COOKIE_NAME}={urllib.parse.quote(token)}; Path=/; HttpOnly; SameSite=Lax{secure}"
 
 
 def _clear_session_cookie() -> str:
-    return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    secure = "; Secure" if _CONFIG.secure_cookies else ""
+    return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
+
+
+def _check_generation_allowed(user: dict[str, object] | None) -> None:
+    if is_admin_user(user):
+        return
+    active_jobs = [
+        job
+        for job in _active_prepare_jobs_for_user(user) + _active_compose_jobs_for_user(user)
+        if str(job.get("status") or "") in {"queued", "running"}
+    ]
+    if len(active_jobs) >= _CONFIG.max_active_jobs_per_user:
+        raise PermissionError("Active job quota exceeded.")
+    _RATE_LIMITER.check(f"generation:{user['id']}", RateLimit(_CONFIG.generation_rate_limit, _CONFIG.generation_rate_window_seconds))
+
+
+def _seed_prepared_project(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = output_dir / "image_candidates"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image_path = image_dir / "fixture_101.ppm"
+    _write_seed_ppm(image_path)
+    project = {
+        "story": {
+            "title": "Seed Prepared Story",
+            "text": "A test story waits in a quiet room.",
+            "source_url": None,
+            "author": None,
+            "license_name": None,
+        },
+        "excerpt": "A test story waits in a quiet room.",
+        "settings": {
+            "target_seconds": 6,
+            "target_words": 14,
+            "width": 640,
+            "height": 360,
+            "words_per_minute": 145,
+            "chunk_seconds": 6,
+            "translator": "mock",
+            "translation_model": "glm-5.2",
+            "prompt_provider": "heuristic",
+            "prompt_model": "glm-5.2",
+            "image_provider": "fixture",
+            "image_model": "glm-image",
+            "image_workers": 1,
+            "candidates_per_chunk": 1,
+            "tts_provider": "silent",
+            "voice": "zh-CN-XiaoxiaoNeural",
+        },
+        "chunks": [
+            {
+                "index": 1,
+                "text": "A test story waits in a quiet room.",
+                "subtitle_text": "A test story waits in a quiet room.",
+                "start_seconds": 0.0,
+                "end_seconds": 6.0,
+                "prompt_candidates": ["quiet test room"],
+                "image_candidates": [
+                    {
+                        "chunk_index": 1,
+                        "candidate_index": 1,
+                        "prompt": "quiet test room",
+                        "asset": {
+                            "index": 1,
+                            "prompt": "quiet test room",
+                            "local_path": str(image_path),
+                            "source_url": "fixture://seed",
+                            "creator": "storyvideogen fixture",
+                            "license_name": "CC0",
+                            "license_url": "",
+                            "provider": "fixture",
+                            "title": "Fixture seed image",
+                            "width": 8,
+                            "height": 8,
+                        },
+                        "error": "",
+                    }
+                ],
+            }
+        ],
+    }
+    _write_seed_json(output_dir / "interactive_project.json", project)
+    _write_seed_json(output_dir / "image_candidates_manifest.json", [project["chunks"][0]["image_candidates"]])
+    _write_seed_json(output_dir / "prompts.json", project["chunks"])
+    write_story_session(output_dir, title="Seed Prepared Story", story_text=project["story"]["text"], status="prepared", message="Image candidates prepared.")
+
+
+def _seed_composed_project(output_dir: Path) -> None:
+    video_path = output_dir / "video.mp4"
+    srt_path = output_dir / "subtitles.zh-CN.srt"
+    video_path.write_bytes(b"seed video")
+    srt_path.write_text("1\n00:00:00,000 --> 00:00:06,000\nSeed subtitle\n", encoding="utf-8")
+    _write_seed_json(output_dir / "video_manifest.json", {"local_path": str(video_path), "duration_seconds": 6.0, "width": 640, "height": 360})
+    write_story_session(output_dir, status="composed", message="Video composed.", video_path=str(video_path), error="")
+
+
+def _write_seed_ppm(path: Path) -> None:
+    with path.open("wb") as file:
+        file.write(b"P6\n8 8\n255\n")
+        for y in range(8):
+            for x in range(8):
+                file.write(bytes((32 + x * 16, 40 + y * 16, 96)))
+
+
+def _write_seed_json(path: Path, data: object) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _start_prepare_job(settings: InteractiveSettings) -> str:
@@ -396,6 +765,101 @@ def _start_prepare_job(settings: InteractiveSettings) -> str:
     thread = threading.Thread(target=_run_prepare_job, args=(job_id, settings), daemon=True)
     thread.start()
     return job_id
+
+
+def _start_compose_job(
+    *,
+    user: dict[str, object],
+    output_dir: Path,
+    selections: dict[int, int],
+    background_music: Path | None,
+    music_volume: float,
+    tts_provider: str,
+    voice: str,
+) -> str:
+    _ensure_compose_workers()
+    job_id = uuid.uuid4().hex
+    payload = {
+        "job_id": job_id,
+        "user_id": int(user["id"]),
+        "output_dir": str(output_dir),
+        "selections": selections,
+        "background_music": str(background_music) if background_music else "",
+        "music_volume": music_volume,
+        "tts_provider": tts_provider,
+        "voice": voice,
+    }
+    with _COMPOSE_LOCK:
+        _COMPOSE_JOBS[job_id] = {
+            "job_id": job_id,
+            "output_dir": str(output_dir),
+            "status": "queued",
+            "message": "Compose job queued.",
+            "error": "",
+            "result": None,
+        }
+    write_story_session(output_dir, status="composing", message="Compose job queued.", job_id=job_id, error="")
+    _COMPOSE_QUEUE.put((job_id, payload))
+    return job_id
+
+
+def _ensure_compose_workers() -> None:
+    global _COMPOSE_WORKERS_STARTED
+    with _COMPOSE_WORKERS_LOCK:
+        if _COMPOSE_WORKERS_STARTED:
+            return
+        for index in range(_CONFIG.worker_count):
+            thread = threading.Thread(target=_compose_worker_loop, name=f"storyvideogen-compose-{index}", daemon=True)
+            thread.start()
+        _COMPOSE_WORKERS_STARTED = True
+
+
+def _compose_worker_loop() -> None:
+    while True:
+        job_id, payload = _COMPOSE_QUEUE.get()
+        try:
+            _run_compose_job(job_id, payload)
+        finally:
+            _COMPOSE_QUEUE.task_done()
+
+
+def _run_compose_job(job_id: str, payload: dict[str, object]) -> None:
+    output_dir = Path(str(payload["output_dir"]))
+    with _COMPOSE_LOCK:
+        _COMPOSE_JOBS[job_id].update({"status": "running", "message": "Composing final video..."})
+    write_story_session(output_dir, status="composing", message="Composing final video.", error="", job_id=job_id)
+    try:
+        result = compose_interactive_project(
+            output_dir=output_dir,
+            selections={int(key): int(value) for key, value in dict(payload["selections"]).items()},
+            background_music=Path(str(payload["background_music"])) if payload.get("background_music") else None,
+            music_volume=float(payload["music_volume"]),
+            tts_provider=str(payload["tts_provider"]),
+            voice=str(payload["voice"]),
+        )
+    except Exception as exc:
+        write_story_session(output_dir, status="failed", message="Compose failed.", error=str(exc), job_id=job_id)
+        with _COMPOSE_LOCK:
+            _COMPOSE_JOBS[job_id].update({"status": "failed", "message": "Compose failed.", "error": str(exc)})
+        return
+
+    write_story_session(
+        output_dir,
+        status="composed",
+        message="Video composed.",
+        error="",
+        video_path=result.get("video_path"),
+        job_id=job_id,
+    )
+    with _COMPOSE_LOCK:
+        _COMPOSE_JOBS[job_id].update(
+            {
+                "status": "complete",
+                "message": "Video composed.",
+                "result": result,
+                "error": "",
+            }
+        )
 
 
 def _run_prepare_job(job_id: str, settings: InteractiveSettings) -> None:
@@ -457,6 +921,23 @@ def _active_prepare_jobs_for_user(user: dict[str, object] | None) -> list[dict[s
     return [
         job
         for job in _active_prepare_jobs()
+        if _path_belongs_to_user(user, Path(str(job.get("output_dir") or "")))
+    ]
+
+
+def _active_jobs_for_user(user: dict[str, object] | None) -> list[dict[str, object]]:
+    return _active_prepare_jobs_for_user(user) + _active_compose_jobs_for_user(user)
+
+
+def _active_compose_jobs() -> list[dict[str, object]]:
+    with _COMPOSE_LOCK:
+        return [copy.deepcopy(job) for job in _COMPOSE_JOBS.values()]
+
+
+def _active_compose_jobs_for_user(user: dict[str, object] | None) -> list[dict[str, object]]:
+    return [
+        job
+        for job in _active_compose_jobs()
         if _path_belongs_to_user(user, Path(str(job.get("output_dir") or "")))
     ]
 
@@ -573,6 +1054,23 @@ _HTML = r"""<!doctype html>
       margin-top: -4px;
     }
 
+    .settings-panel {
+      border-top: 1px solid var(--line);
+      margin-top: 18px;
+      padding-top: 18px;
+    }
+
+    .inline-choice {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      text-transform: none;
+    }
+
+    .inline-choice input {
+      width: auto;
+    }
+
     input, select, textarea {
       width: 100%;
       border: 1px solid var(--line);
@@ -608,6 +1106,16 @@ _HTML = r"""<!doctype html>
 
     button.secondary {
       background: var(--ink);
+    }
+
+    .download-link {
+      border-radius: 999px;
+      background: #35534b;
+      color: #fff8ed;
+      display: inline-block;
+      font: 700 16px/1 Georgia, "Times New Roman", serif;
+      padding: 13px 18px;
+      text-decoration: none;
     }
 
     button:disabled {
@@ -827,13 +1335,37 @@ _HTML = r"""<!doctype html>
         </div>
         <div id="story-list-status" class="status"></div>
         <div id="story-list" class="story-list">Loading stories...</div>
+
+        <section class="settings-panel">
+          <h2>Settings</h2>
+          <form id="api-settings-form">
+            <label>ZAI API key <input name="zai_api_key" type="password" autocomplete="off" placeholder="Leave blank to keep current key"></label>
+            <label><span class="inline-choice"><input name="clear_zai_api_key" type="checkbox"> Clear saved ZAI key</span></label>
+            <label>Zhipu image API key <input name="zhipu_image_api_key" type="password" autocomplete="off" placeholder="Optional; ZAI key is also accepted"></label>
+            <label><span class="inline-choice"><input name="clear_zhipu_image_api_key" type="checkbox"> Clear saved Zhipu image key</span></label>
+            <label>SiliconFlow API key <input name="siliconflow_api_key" type="password" autocomplete="off" placeholder="Optional"></label>
+            <label><span class="inline-choice"><input name="clear_siliconflow_api_key" type="checkbox"> Clear saved SiliconFlow key</span></label>
+            <label>Pixabay API key <input name="pixabay_api_key" type="password" autocomplete="off" placeholder="Optional"></label>
+            <label><span class="inline-choice"><input name="clear_pixabay_api_key" type="checkbox"> Clear saved Pixabay key</span></label>
+            <div id="api-key-status" class="hint">API keys not loaded.</div>
+            <button type="submit">Save API Settings</button>
+          </form>
+
+          <form id="password-settings-form">
+            <label>Current password <input name="current_password" type="password" autocomplete="current-password"></label>
+            <label>New password <input name="new_password" type="password" autocomplete="new-password"></label>
+            <div id="password-status" class="status"></div>
+            <button type="submit" class="secondary">Change Password</button>
+          </form>
+        </section>
       </aside>
 
       <section class="grid">
         <form id="settings" class="panel">
           <h2>Project</h2>
           <label>English title <input name="title" value="Story Title"></label>
-          <label>Target output directory <input name="output_dir" value="output/ui_stories/story-title"></label>
+          <label>Target output directory <input name="output_dir" value="" readonly></label>
+          <div class="hint">Managed automatically from the selected story. Create or select a story before preparing images.</div>
           <label>Story text <textarea name="story_text" placeholder="Paste the story here..."></textarea></label>
 
         <h2>Generation</h2>
@@ -941,6 +1473,10 @@ _HTML = r"""<!doctype html>
     const refreshStoriesButton = document.querySelector("#refresh-stories");
     const storyListStatusEl = document.querySelector("#story-list-status");
     const storyListEl = document.querySelector("#story-list");
+    const apiSettingsForm = document.querySelector("#api-settings-form");
+    const passwordSettingsForm = document.querySelector("#password-settings-form");
+    const apiKeyStatusEl = document.querySelector("#api-key-status");
+    const passwordStatusEl = document.querySelector("#password-status");
     const statusEl = document.querySelector("#status");
     const chunksEl = document.querySelector("#chunks");
     const prepareButton = document.querySelector("#prepare");
@@ -951,6 +1487,8 @@ _HTML = r"""<!doctype html>
     window.currentProject = null;
     window.stories = [];
     window.activeWatchers = {};
+    window.activeComposeWatchers = {};
+    window.csrfToken = "";
     window.editorBusy = false;
 
     function formPayload() {
@@ -962,9 +1500,32 @@ _HTML = r"""<!doctype html>
       return workspaceInput.value.trim() || "output/ui_stories";
     }
 
+    function requireSelectedStory() {
+      if (!window.currentStory || !window.currentStory.output_dir) {
+        throw new Error("Create or select a story first.");
+      }
+      setField("output_dir", window.currentStory.output_dir);
+      return window.currentStory.output_dir;
+    }
+
+    function payloadForCurrentStory() {
+      const payload = formPayload();
+      payload.output_dir = requireSelectedStory();
+      return payload;
+    }
+
     function authPayload(authForm) {
       const data = new FormData(authForm);
       return Object.fromEntries(data.entries());
+    }
+
+    function formObject(targetForm) {
+      const data = new FormData(targetForm);
+      const payload = Object.fromEntries(data.entries());
+      for (const checkbox of targetForm.querySelectorAll('input[type="checkbox"]')) {
+        payload[checkbox.name] = checkbox.checked;
+      }
+      return payload;
     }
 
     function showAuth() {
@@ -980,7 +1541,9 @@ _HTML = r"""<!doctype html>
       currentUserEl.textContent = `Logged in as ${user.username}`;
       currentWorkspaceEl.textContent = workspace;
       workspaceInput.value = workspace;
+      setField("output_dir", "");
       await loadStories();
+      await loadAccountSettings();
     }
 
     function setField(name, value) {
@@ -997,14 +1560,14 @@ _HTML = r"""<!doctype html>
 
     function updateEditorControls() {
       const isPreparing = window.currentStory && window.currentStory.status === "preparing";
-      prepareButton.disabled = window.editorBusy || isPreparing;
-      composeButton.disabled = window.editorBusy || isPreparing || !window.currentProject || !window.canCompose;
+      prepareButton.disabled = window.editorBusy || isPreparing || !window.currentStory;
+      composeButton.disabled = window.editorBusy || isPreparing || !window.currentStory || !window.currentProject || !window.canCompose;
     }
 
     async function postJson(url, payload) {
       const response = await fetch(url, {
         method: "POST",
-        headers: {"Content-Type": "application/json"},
+        headers: {"Content-Type": "application/json", "X-CSRF-Token": window.csrfToken || ""},
         body: JSON.stringify(payload)
       });
       const data = await response.json();
@@ -1038,6 +1601,8 @@ _HTML = r"""<!doctype html>
       for (const story of window.stories) {
         if (story.status === "preparing" && story.job_id) {
           watchPrepareJob(story.job_id, story.output_dir);
+        } else if ((story.status === "queued" || story.status === "composing") && story.job_id) {
+          watchComposeJob(story.job_id, story.output_dir);
         }
       }
       return window.stories;
@@ -1046,10 +1611,28 @@ _HTML = r"""<!doctype html>
     async function loadCurrentUser() {
       const session = await getJson("/api/me");
       if (session.user) {
+        window.csrfToken = session.csrf_token || "";
         await showApp(session.user, session.workspace);
       } else {
         showAuth();
       }
+    }
+
+    async function loadAccountSettings() {
+      const settings = await getJson("/api/account");
+      renderAccountSettings(settings);
+      return settings;
+    }
+
+    function renderAccountSettings(settings) {
+      const apiKeys = (settings && settings.api_keys) || {};
+      const labels = [
+        `ZAI: ${apiKeys.zai ? "configured" : "missing"}`,
+        `Zhipu image: ${apiKeys.zhipu_image ? "configured" : "missing"}`,
+        `SiliconFlow: ${apiKeys.siliconflow ? "configured" : "missing"}`,
+        `Pixabay: ${apiKeys.pixabay ? "configured" : "missing"}`
+      ];
+      apiKeyStatusEl.textContent = labels.join(" | ");
     }
 
     function renderStoryList(stories) {
@@ -1174,7 +1757,7 @@ _HTML = r"""<!doctype html>
         chunkActions.className = "chunk-actions";
         const manualButton = document.createElement("button");
         manualButton.type = "button";
-        manualButton.textContent = "Choose Local Image";
+        manualButton.textContent = "Upload Image From This Laptop";
         manualButton.addEventListener("click", () => chooseLocalImage(chunk.index));
         chunkActions.appendChild(manualButton);
         section.appendChild(chunkActions);
@@ -1220,6 +1803,32 @@ _HTML = r"""<!doctype html>
         chunksEl.appendChild(section);
       }
       updateEditorControls();
+      renderDownloadLinks();
+    }
+
+    function renderDownloadLinks() {
+      const existing = document.querySelector("#downloads");
+      if (existing) {
+        existing.remove();
+      }
+      if (!window.currentStory || !window.currentStory.video_path) {
+        return;
+      }
+      const downloads = document.createElement("div");
+      downloads.id = "downloads";
+      downloads.className = "actions";
+      const video = document.createElement("a");
+      video.href = `/api/download?path=${encodeURIComponent(window.currentStory.video_path)}`;
+      video.textContent = "Download Video";
+      video.className = "download-link";
+      downloads.appendChild(video);
+      const srtPath = `${window.currentStory.output_dir}/subtitles.zh-CN.srt`;
+      const subtitles = document.createElement("a");
+      subtitles.href = `/api/download?path=${encodeURIComponent(srtPath)}`;
+      subtitles.textContent = "Download SRT";
+      subtitles.className = "download-link";
+      downloads.appendChild(subtitles);
+      statusEl.after(downloads);
     }
 
     async function chooseLocalImage(chunkIndex) {
@@ -1237,11 +1846,12 @@ _HTML = r"""<!doctype html>
         try {
           statusEl.textContent = `Uploading local image for chunk ${chunkIndex}...`;
           const data = new FormData();
-          data.append("output_dir", formPayload().output_dir);
+          data.append("output_dir", requireSelectedStory());
           data.append("chunk_index", String(chunkIndex));
           data.append("image", input.files[0]);
           const response = await fetch("/api/manual-image", {
             method: "POST",
+            headers: {"X-CSRF-Token": window.csrfToken || ""},
             body: data
           });
           const result = await response.json();
@@ -1275,7 +1885,7 @@ _HTML = r"""<!doctype html>
 
     prepareButton.addEventListener("click", async () => {
       try {
-        const payload = formPayload();
+        const payload = payloadForCurrentStory();
         window.currentProject = null;
         window.canCompose = false;
         if (window.currentStory) {
@@ -1348,19 +1958,67 @@ _HTML = r"""<!doctype html>
       }
     }
 
+    function watchComposeJob(jobId, outputDir) {
+      if (!jobId || window.activeComposeWatchers[jobId]) {
+        return;
+      }
+      window.activeComposeWatchers[jobId] = true;
+      pollComposeJob(jobId, outputDir);
+    }
+
+    async function pollComposeJob(jobId, outputDir) {
+      try {
+        const job = await getJson(`/api/compose-job?job_id=${encodeURIComponent(jobId)}`);
+        const isCurrent = window.currentStory && window.currentStory.output_dir === outputDir;
+        if (isCurrent) {
+          window.currentStory.status = job.status === "running" ? "composing" : job.status;
+          window.currentStory.message = job.message || "";
+          statusEl.textContent = job.error || job.message || "Composing final video...";
+          updateEditorControls();
+        }
+        if (job.status === "complete") {
+          delete window.activeComposeWatchers[jobId];
+          await loadStories();
+          if (isCurrent) {
+            await loadStory(outputDir);
+            statusEl.textContent = `Video complete:\n${job.result.video_path || job.result.run_plan}`;
+          }
+          return;
+        }
+        if (job.status === "failed") {
+          delete window.activeComposeWatchers[jobId];
+          await loadStories();
+          if (isCurrent) {
+            statusEl.textContent = job.error || "Compose failed.";
+            updateEditorControls();
+          }
+          return;
+        }
+        setTimeout(() => pollComposeJob(jobId, outputDir), 1200);
+      } catch (error) {
+        delete window.activeComposeWatchers[jobId];
+        if (window.currentStory && window.currentStory.output_dir === outputDir) {
+          statusEl.textContent = error.message;
+          updateEditorControls();
+        }
+      }
+    }
+
     composeButton.addEventListener("click", async () => {
       try {
-        const payload = formPayload();
+        const payload = payloadForCurrentStory();
         payload.selections = selectedCandidates();
-        window.editorBusy = true;
-        setEditorStatus("Composing final video...");
+        if (window.currentStory) {
+          window.currentStory.status = "queued";
+        }
+        setEditorStatus("Queueing compose job...");
         const result = await postJson("/api/compose", payload);
-        window.editorBusy = false;
-        setEditorStatus(`Video complete:\n${result.video_path || result.run_plan}`);
+        if (window.currentStory) {
+          window.currentStory.job_id = result.job_id;
+        }
+        watchComposeJob(result.job_id, payload.output_dir);
         await loadStories();
-        await loadStory(payload.output_dir);
       } catch (error) {
-        window.editorBusy = false;
         setEditorStatus(error.message);
       }
     });
@@ -1370,6 +2028,7 @@ _HTML = r"""<!doctype html>
       try {
         loginStatusEl.textContent = "Logging in...";
         const result = await postJson("/api/login", authPayload(loginForm));
+        window.csrfToken = result.csrf_token || "";
         loginForm.reset();
         loginStatusEl.textContent = "";
         await showApp(result.user, result.workspace);
@@ -1383,6 +2042,7 @@ _HTML = r"""<!doctype html>
       try {
         registerStatusEl.textContent = "Creating account...";
         const result = await postJson("/api/register", authPayload(registerForm));
+        window.csrfToken = result.csrf_token || "";
         registerForm.reset();
         registerStatusEl.textContent = "";
         await showApp(result.user, result.workspace);
@@ -1391,13 +2051,40 @@ _HTML = r"""<!doctype html>
       }
     });
 
+    apiSettingsForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        apiKeyStatusEl.textContent = "Saving API settings...";
+        const result = await postJson("/api/account/api-keys", formObject(apiSettingsForm));
+        apiSettingsForm.reset();
+        renderAccountSettings(result);
+      } catch (error) {
+        apiKeyStatusEl.textContent = error.message;
+      }
+    });
+
+    passwordSettingsForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        passwordStatusEl.textContent = "Changing password...";
+        await postJson("/api/account/password", formObject(passwordSettingsForm));
+        passwordSettingsForm.reset();
+        passwordStatusEl.textContent = "Password changed.";
+      } catch (error) {
+        passwordStatusEl.textContent = error.message;
+      }
+    });
+
     logoutButton.addEventListener("click", async () => {
       try {
         await postJson("/api/logout", {});
       } finally {
+        window.csrfToken = "";
         window.currentStory = null;
         window.currentProject = null;
         window.stories = [];
+        apiKeyStatusEl.textContent = "API keys not loaded.";
+        passwordStatusEl.textContent = "";
         storyListEl.textContent = "Login to load stories.";
         chunksEl.textContent = "Create or select a story to begin.";
         showAuth();

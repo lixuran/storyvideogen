@@ -1,28 +1,28 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from storyvideogen.image_search.download import download_image
 from storyvideogen.models import ImageAsset
+from storyvideogen.provider_credentials import credential_value
 
 
 class SiliconFlowImageProvider:
     name = "siliconflow"
 
-    def __init__(self, model: str = "Kwai-Kolors/Kolors", image_size: str = "1024x1024") -> None:
+    def __init__(self, model: str = "Kwai-Kolors/Kolors", image_size: str = "1024x1024", api_key: str | None = None) -> None:
         self.model = model
         self.image_size = image_size
+        self.api_key = api_key or credential_value("SILICONFLOW_API_KEY")
 
     def fetch_image(self, prompt: str, output_dir: Path, index: int) -> ImageAsset:
-        api_key = os.environ.get("SILICONFLOW_API_KEY")
-        if not api_key:
+        if not self.api_key:
             raise RuntimeError("SILICONFLOW_API_KEY is required for --image-provider siliconflow.")
 
-        image_url = self._generate_image_url(prompt, api_key)
+        image_url = self._generate_image_url(prompt, self.api_key)
         local_path = download_image(image_url, output_dir, f"siliconflow_{index:03}", timeout_seconds=30)
         return ImageAsset(
             index=index,

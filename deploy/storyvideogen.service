@@ -1,0 +1,28 @@
+[Unit]
+Description=StoryVideoGen Node API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=storyvideogen
+Group=storyvideogen
+WorkingDirectory=/opt/storyvideogen
+EnvironmentFile=/etc/storyvideogen/storyvideogen.env
+ExecStart=/usr/bin/node /opt/storyvideogen/server/dist/index.js
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
+ReadWritePaths=/opt/storyvideogen/output
+
+[Install]
+WantedBy=multi-user.target

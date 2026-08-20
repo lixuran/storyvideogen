@@ -1,0 +1,1 @@
+CREATE TABLE fixture_migration_1 (id TEXT PRIMARY KEY) STRICT;
