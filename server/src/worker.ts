@@ -32,6 +32,7 @@ try {
         const credentials: Record<string, string> = {};
         if (job.payload.provider === "zhipu") credentials.ZAI_API_KEY = providers.resolve(job.userId, "zhipu").value;
         if (job.payload.provider === "siliconflow") credentials.SILICONFLOW_API_KEY = providers.resolve(job.userId, "siliconflow").value;
+        if (job.payload.provider === "pexels") credentials.PEXELS_API_KEY = providers.resolve(job.userId, "pexels").value;
         if (job.payload.provider === "pixabay") credentials.PIXABAY_API_KEY = providers.resolve(job.userId, "pixabay").value;
         const execution = await supervisor.execute(job, credentials);
         if (execution) {

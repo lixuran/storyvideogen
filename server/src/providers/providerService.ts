@@ -5,6 +5,7 @@ import type {SecretCipher} from "../security/secretCipher.js";
 const providerDefinitions = [
   {id: "zhipu", label: "Zhipu AI", text: true, image: true, search: false},
   {id: "siliconflow", label: "SiliconFlow", text: false, image: true, search: false},
+  {id: "pexels", label: "Pexels", text: false, image: false, search: true},
   {id: "pixabay", label: "Pixabay", text: false, image: false, search: true}
 ] as const;
 

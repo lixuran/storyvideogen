@@ -120,6 +120,7 @@ class UIServerTest(unittest.TestCase):
     def test_ui_exposes_account_settings_controls(self) -> None:
         self.assertIn('id="api-settings-form"', WEB_MAIN)
         self.assertIn('name="zai_api_key"', WEB_MAIN)
+        self.assertIn('name="pexels_api_key"', WEB_MAIN)
         self.assertIn('name="clear_zai_api_key"', WEB_MAIN)
         self.assertIn('id="password-settings-form"', WEB_MAIN)
         self.assertIn("/api/account/api-keys", WEB_MAIN)
@@ -137,13 +138,14 @@ class UIServerTest(unittest.TestCase):
         updates, clear_names = _api_key_updates_from_payload(
             {
                 "zai_api_key": "zai-secret",
+                "pexels_api_key": "pexels-secret",
                 "pixabay_api_key": "",
                 "clear_pixabay_api_key": True,
                 "ignored": "secret",
             }
         )
 
-        self.assertEqual(updates, {"ZAI_API_KEY": "zai-secret"})
+        self.assertEqual(updates, {"ZAI_API_KEY": "zai-secret", "PEXELS_API_KEY": "pexels-secret"})
         self.assertEqual(clear_names, {"PIXABAY_API_KEY"})
 
     def test_e2e_seed_helpers_write_prepared_and_composed_state(self) -> None:

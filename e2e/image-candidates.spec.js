@@ -21,11 +21,10 @@ test("@m7 generated and uploaded scene images can be selected durably", async ({
   await candidates.getByRole("button", {name: "Choose image"}).first().click();
   await expect(candidates.getByRole("button", {name: "Selected"})).toBeVisible();
 
-  await page.getByLabel("Image source").selectOption("baidu");
-  await page.getByRole("button", {name: "Generate 2 images with Baidu"}).click();
+  await page.getByLabel("Image source").selectOption("pexels");
+  await page.getByRole("button", {name: "Generate 2 images with Pexels"}).click();
   expect(await startFixtureWorker()).toBe(0);
-  await expect(candidates.locator(".candidate-card").filter({hasText: "baidu"})).toHaveCount(2, {timeout: 20_000});
-  await candidates.locator(".candidate-card").filter({hasText: "baidu"}).first().getByRole("button", {name: "Choose image"}).click();
+  await expect(candidates.locator(".candidate-card").filter({hasText: "pexels"})).toHaveCount(2, {timeout: 20_000});
 
   await page.getByLabel("Upload an image for this scene").setInputFiles({name: "manual.png", mimeType: "image/png", buffer: tinyPng});
   await page.getByRole("button", {name: "Add candidate"}).click();

@@ -7,7 +7,7 @@ from storyvideogen.image_search.providers import build_image_provider
 
 class ImageProviderContractTest(unittest.TestCase):
     def test_every_retained_provider_exposes_the_fetch_contract(self) -> None:
-        for name in ("zhipu", "siliconflow", "baidu", "pixabay", "openverse", "wikimedia", "fixture"):
+        for name in ("zhipu", "siliconflow", "baidu", "pexels", "pixabay", "openverse", "wikimedia", "fixture"):
             with self.subTest(provider=name):
                 provider = build_image_provider(name)
                 self.assertEqual(provider.name, name)

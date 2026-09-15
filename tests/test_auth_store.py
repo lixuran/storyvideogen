@@ -56,11 +56,11 @@ class AuthStoreTest(unittest.TestCase):
             user = store.register_user("alice", "password123")
             user_id = int(user["id"])
 
-            store.update_api_keys(user_id, {"ZAI_API_KEY": "zai-secret", "PIXABAY_API_KEY": "pixabay-secret"})
+            store.update_api_keys(user_id, {"ZAI_API_KEY": "zai-secret", "PEXELS_API_KEY": "pexels-secret", "PIXABAY_API_KEY": "pixabay-secret"})
 
             self.assertEqual(
                 store.provider_credentials(user_id),
-                {"ZAI_API_KEY": "zai-secret", "PIXABAY_API_KEY": "pixabay-secret"},
+                {"ZAI_API_KEY": "zai-secret", "PEXELS_API_KEY": "pexels-secret", "PIXABAY_API_KEY": "pixabay-secret"},
             )
             self.assertEqual(
                 store.account_settings(user_id),
@@ -69,6 +69,7 @@ class AuthStoreTest(unittest.TestCase):
                         "zai": True,
                         "zhipu_image": False,
                         "siliconflow": False,
+                        "pexels": True,
                         "pixabay": True,
                     }
                 },

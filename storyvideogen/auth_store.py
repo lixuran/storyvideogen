@@ -142,6 +142,7 @@ class AuthStore:
                 "zai": "ZAI_API_KEY" in names,
                 "zhipu_image": "ZHIPU_IMAGE_API_KEY" in names,
                 "siliconflow": "SILICONFLOW_API_KEY" in names,
+                "pexels": "PEXELS_API_KEY" in names,
                 "pixabay": "PIXABAY_API_KEY" in names,
             }
         }
@@ -158,7 +159,7 @@ class AuthStore:
 
     def update_api_keys(self, user_id: int, values: dict[str, str], clear_names: set[str] | None = None) -> None:
         clear_names = clear_names or set()
-        allowed_names = {"ZAI_API_KEY", "ZHIPU_IMAGE_API_KEY", "SILICONFLOW_API_KEY", "PIXABAY_API_KEY"}
+        allowed_names = {"ZAI_API_KEY", "ZHIPU_IMAGE_API_KEY", "SILICONFLOW_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY"}
         unknown_names = set(values) | clear_names
         unknown_names -= allowed_names
         if unknown_names:

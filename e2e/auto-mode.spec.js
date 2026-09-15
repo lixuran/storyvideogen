@@ -13,6 +13,7 @@ test("@m14 auto mode finishes in the background with concurrent workers", async 
   await expect(page).toHaveURL(/\/create\?story=/);
   const storyId = new URL(page.url()).searchParams.get("story");
   expect(storyId).toBeTruthy();
+  await page.getByLabel("Auto image source").selectOption("pexels");
 
   await page.getByRole("button", {name: "Auto-create podcast"}).click();
   await expect(page.getByRole("status")).toContainText("Auto mode queued");
@@ -35,7 +36,9 @@ test("@m14 auto mode finishes in the background with concurrent workers", async 
     const imageJobs = database.prepare("SELECT payload_json FROM jobs WHERE story_id = ? AND type = 'generate_images' ORDER BY created_at, id").all(storyId);
     expect(imageJobs).toHaveLength(2);
     for (const row of imageJobs) {
-      const candidateIds = JSON.parse(row.payload_json).candidateIds;
+      const payload = JSON.parse(row.payload_json);
+      expect(payload.candidateProvider).toBe("pexels");
+      const candidateIds = payload.candidateIds;
       expect(database.prepare("SELECT is_selected FROM image_candidates WHERE id = ?").get(candidateIds[0]).is_selected).toBe(1);
     }
   } finally { database.close(); }

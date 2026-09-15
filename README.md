@@ -31,9 +31,11 @@ Then open `http://127.0.0.1:3000`. Register or log in, save a named full-story d
 
 SQLite owns story/job metadata and opaque asset IDs. Generated and uploaded files are stored below `output/assets/`; filesystem paths are never accepted from the browser or returned by the API.
 
-For ZAI-powered translation, prompt generation, or Zhipu image generation, open the
-left-panel Settings section after login and save your `ZAI_API_KEY`. The UI stores
-the key for the current user and only shows whether each key is configured.
+For ZAI-powered translation, prompt generation, Zhipu image generation, or Pexels
+image search, open the left-panel Settings section after login and save the
+corresponding provider key. The UI encrypts the key for the current user and only
+shows whether each key is configured. Administrators can provide platform fallback
+keys from Admin Provider Keys.
 
 Run browser end-to-end tests:
 
@@ -241,6 +243,22 @@ Faster image path with Pixabay:
 $env:ZAI_API_KEY="your-zai-api-key"
 $env:PIXABAY_API_KEY="your-api-key"
 node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --translator zai --translation-model glm-5.2 --prompt-provider zai --prompt-model glm-5.2 --image-provider pixabay --image-workers 6 --tts-provider edge
+```
+
+Pexels photo-search path:
+
+```bash
+$env:ZAI_API_KEY="your-zai-api-key"
+$env:PEXELS_API_KEY="your-pexels-api-key"
+node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --translator zai --translation-model glm-5.2 --prompt-provider zai --prompt-model glm-5.2 --image-provider pexels --image-workers 4 --tts-provider edge
+```
+
+Pexels results retain the photographer, photo-page URL, and Pexels License in the
+image manifest and rendered credits. Obtain a key from the Pexels API dashboard.
+Run the explicit live browser verification with `PEXELS_API_KEY` set:
+
+```bash
+npm run verify:live:pexels
 ```
 
 China-oriented fast image path without an API key:

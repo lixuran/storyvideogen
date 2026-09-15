@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.add_argument(
         "--image-provider",
-        choices=["baidu", "fixture", "openverse", "pixabay", "siliconflow", "wikimedia", "zhipu"],
+        choices=["baidu", "fixture", "openverse", "pexels", "pixabay", "siliconflow", "wikimedia", "zhipu"],
         default="zhipu",
         help="Image source provider. Use fixture for deterministic offline testing.",
     )

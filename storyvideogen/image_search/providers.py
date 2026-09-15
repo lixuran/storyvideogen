@@ -4,6 +4,7 @@ from .baidu import BaiduImageProvider
 from .base import ImageProvider
 from .fixture import FixtureImageProvider
 from .openverse import OpenverseImageProvider
+from .pexels import PexelsImageProvider
 from .pixabay import PixabayImageProvider
 from .siliconflow import SiliconFlowImageProvider
 from .wikimedia import WikimediaImageProvider
@@ -18,6 +19,8 @@ def build_image_provider(name: str, model: str = "glm-image") -> ImageProvider:
         return FixtureImageProvider()
     if normalized == "openverse":
         return OpenverseImageProvider()
+    if normalized == "pexels":
+        return PexelsImageProvider()
     if normalized == "pixabay":
         return PixabayImageProvider()
     if normalized == "siliconflow":

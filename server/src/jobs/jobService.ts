@@ -104,7 +104,7 @@ export class JobService {
   }
 }
 
-function providerName(value: unknown): string { const provider = typeof value === "string" ? value.trim().toLowerCase() : "zhipu"; if (!["zhipu", "siliconflow", "baidu", "pixabay", "openverse", "wikimedia"].includes(provider)) throw new ApiError(400, "IMAGE_PROVIDER_INVALID", "The image provider is not supported."); return provider; }
+function providerName(value: unknown): string { const provider = typeof value === "string" ? value.trim().toLowerCase() : "zhipu"; if (!["zhipu", "siliconflow", "baidu", "pexels", "pixabay", "openverse", "wikimedia"].includes(provider)) throw new ApiError(400, "IMAGE_PROVIDER_INVALID", "The image provider is not supported."); return provider; }
 function candidateCount(value: unknown): number { const count = value === undefined ? 2 : value; if (!Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > 4) throw new ApiError(400, "IMAGE_COUNT_INVALID", "Generate between one and four image candidates."); return count as number; }
 function narrationVoice(value: unknown): string { const voice = typeof value === "string" ? value.trim() : "zh-CN-XiaoxiaoNeural"; if (!/^[A-Za-z0-9-]{3,100}$/.test(voice)) throw new ApiError(400, "VOICE_INVALID", "Choose a supported narration voice."); return voice; }
 function sceneDurationSeconds(value: unknown): number { const seconds = value === undefined ? 30 : value; if (!Number.isSafeInteger(seconds) || (seconds as number) < 15 || (seconds as number) > 120) throw new ApiError(400, "CHUNK_DURATION_INVALID", "Scene duration must be between 15 and 120 seconds."); return seconds as number; }

@@ -127,6 +127,7 @@ app.innerHTML = `
                     <option value="zhipu" selected>zhipu</option>
                     <option value="siliconflow">siliconflow</option>
                     <option value="baidu">baidu</option>
+                    <option value="pexels">pexels</option>
                     <option value="pixabay">pixabay</option>
                     <option value="openverse">openverse</option>
                     <option value="wikimedia">wikimedia</option>
@@ -175,6 +176,8 @@ app.innerHTML = `
               <label><span class="inline-choice"><input name="clear_zhipu_image_api_key" type="checkbox"> Clear saved Zhipu image key</span></label>
               <label>SiliconFlow API key <input name="siliconflow_api_key" type="password" autocomplete="off" placeholder="Optional"></label>
               <label><span class="inline-choice"><input name="clear_siliconflow_api_key" type="checkbox"> Clear saved SiliconFlow key</span></label>
+              <label>Pexels API key <input name="pexels_api_key" type="password" autocomplete="off" placeholder="Optional"></label>
+              <label><span class="inline-choice"><input name="clear_pexels_api_key" type="checkbox"> Clear saved Pexels key</span></label>
               <label>Pixabay API key <input name="pixabay_api_key" type="password" autocomplete="off" placeholder="Optional"></label>
               <label><span class="inline-choice"><input name="clear_pixabay_api_key" type="checkbox"> Clear saved Pixabay key</span></label>
               <div id="api-key-status" class="hint">API keys not loaded.</div>
@@ -384,6 +387,7 @@ function renderAccountSettings(settings) {
     `ZAI: ${apiKeys.zai ? "configured" : "missing"}`,
     `Zhipu image: ${apiKeys.zhipu_image ? "configured" : "missing"}`,
     `SiliconFlow: ${apiKeys.siliconflow ? "configured" : "missing"}`,
+    `Pexels: ${apiKeys.pexels ? "configured" : "missing"}`,
     `Pixabay: ${apiKeys.pixabay ? "configured" : "missing"}`
   ];
   apiKeyStatusEl.textContent = labels.join(" | ");
@@ -555,6 +559,16 @@ function renderProject(project, canCompose = false) {
       meta.className = "meta";
       meta.textContent = candidate.prompt;
       card.appendChild(meta);
+      if (candidate.asset && candidate.asset.source_url) {
+        const source = document.createElement("a");
+        source.href = candidate.asset.source_url;
+        source.target = "_blank";
+        source.rel = "noreferrer";
+        source.textContent = candidate.asset.provider === "pexels"
+          ? `Photo by ${candidate.asset.creator || "a Pexels photographer"} on Pexels`
+          : "View image source";
+        card.appendChild(source);
+      }
       cards.appendChild(card);
     }
     section.appendChild(cards);
