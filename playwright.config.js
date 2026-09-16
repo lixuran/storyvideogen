@@ -44,6 +44,16 @@ export default defineConfig({
         browserName,
         baseURL: `http://127.0.0.1:${nodePort}`
       }
+    },
+    {
+      name: "live-pexels",
+      grep: /@live-pexels/,
+      testMatch: /live-pexels.*\.spec\.[jt]s/,
+      use: {
+        ...devices["Desktop Chrome"],
+        browserName,
+        baseURL: `http://127.0.0.1:${nodePort}`
+      }
     }
   ],
   webServer: [

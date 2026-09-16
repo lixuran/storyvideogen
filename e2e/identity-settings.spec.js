@@ -22,6 +22,13 @@ test("@m3 user registration, provider settings, password rotation, and logout", 
   await expect(page.getByText("Provider capabilities verified.")).toBeVisible();
   await expect(page.getByText("Text: available · Image/search: available")).toBeVisible();
 
+  const pexelsKey = "synthetic-pexels-key-5678";
+  const pexelsCard = page.locator(".provider-card").filter({has: page.getByRole("heading", {name: "Pexels", exact: true})});
+  await pexelsCard.getByLabel("Pexels API key").fill(pexelsKey);
+  await pexelsCard.getByRole("button", {name: "Save", exact: true}).click();
+  await expect(pexelsCard.getByText("Saved key ending 5678")).toBeVisible();
+  await expect(page.locator("body")).not.toContainText(pexelsKey);
+
   const rejected = await page.request.post("/api/v1/auth/logout");
   expect(rejected.status()).toBe(403);
   await expect(rejected.json()).resolves.toMatchObject({error: {code: "CSRF_INVALID"}});

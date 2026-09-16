@@ -34,6 +34,7 @@ const providerByLegacyName: Record<string, string> = {
   ZAI_API_KEY: "zhipu",
   ZHIPU_IMAGE_API_KEY: "zhipu",
   SILICONFLOW_API_KEY: "siliconflow",
+  PEXELS_API_KEY: "pexels",
   PIXABAY_API_KEY: "pixabay"
 };
 

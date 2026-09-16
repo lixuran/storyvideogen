@@ -95,6 +95,7 @@ test("expired sessions and cross-user provider access are denied", async () => {
     const providers = new ProviderService(repository, cipher);
     const owner = new AuthService(identities, 3600).register("secret-owner", "owner-password").user;
     const stranger = new AuthService(identities, 3600).register("secret-stranger", "stranger-password").user;
+    assert.deepEqual(providers.list(owner.id).find((provider) => provider.id === "pexels")?.capabilities, {text: false, image: false, search: true});
     providers.save(owner.id, "zhipu", "synthetic-private-key");
     assert.equal(providers.list(stranger.id).find((provider) => provider.id === "zhipu")?.configured, false);
     assert.throws(() => providers.resolve(stranger.id, "zhipu"), /Configure zhipu/);

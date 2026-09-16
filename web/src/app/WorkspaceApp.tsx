@@ -894,6 +894,7 @@ function CreateWorkspace() {
                     <option value="zhipu">Zhipu generation</option>
                     <option value="baidu">Baidu search</option>
                     <option value="siliconflow">SiliconFlow generation</option>
+                    <option value="pexels">Pexels search</option>
                     <option value="pixabay">Pixabay search</option>
                     <option value="openverse">Openverse search</option>
                     <option value="wikimedia">Wikimedia search</option>
@@ -1157,6 +1158,7 @@ function CreateWorkspace() {
                           <option value="siliconflow">
                             SiliconFlow generation
                           </option>
+                          <option value="pexels">Pexels search</option>
                           <option value="pixabay">Pixabay search</option>
                           <option value="openverse">Openverse search</option>
                           <option value="wikimedia">Wikimedia search</option>
@@ -1219,6 +1221,13 @@ function CreateWorkspace() {
                           <strong>{candidate.provider}</strong>
                           <span>{candidate.model ?? "uploaded"}</span>
                         </div>
+                        {candidate.sourceUrl ? (
+                          <a href={candidate.sourceUrl} target="_blank" rel="noreferrer">
+                            {candidate.provider === "pexels"
+                              ? `Photo by ${candidate.attributionText || "a Pexels photographer"} on Pexels`
+                              : "View image source"}
+                          </a>
+                        ) : null}
                         {candidate.status === "ready" ? (
                           <button
                             className={
@@ -2041,6 +2050,7 @@ function providerLabel(provider: string): string {
         zhipu: "Zhipu",
         siliconflow: "SiliconFlow",
         baidu: "Baidu",
+        pexels: "Pexels",
         pixabay: "Pixabay",
         openverse: "Openverse",
         wikimedia: "Wikimedia",

@@ -6,7 +6,7 @@ import {openDatabase} from "../db/database.js";
 import {migrateDatabase} from "../db/migrate.js";
 import {BillingRepository} from "./billingRepository.js";
 
-test("plan seeding grants and refreshes the 1000 image quota", () => {
+test("plan seeding grants and refreshes the 10000 image quota", () => {
   const database = openDatabase({filename: ":memory:", busyTimeoutMs: 5_000});
   try {
     migrateDatabase(database, path.resolve("server", "migrations"));
@@ -18,8 +18,8 @@ test("plan seeding grants and refreshes the 1000 image quota", () => {
     repository.seed("2026-08-18T00:02:00.000Z");
 
     const plans = Object.fromEntries(repository.plans().map((plan) => [plan.code, JSON.parse(plan.quotaJson)]));
-    assert.equal(plans.trial.image_assets, 1_000);
-    assert.equal(plans.creator.image_assets, 1_000);
+    assert.deepEqual(plans.trial, {planning_jobs: 50, image_assets: 10_000, render_jobs: 20});
+    assert.deepEqual(plans.creator, {planning_jobs: 1_000, image_assets: 10_000, render_jobs: 500});
     const trial = database.prepare("SELECT updated_at AS updatedAt FROM plans WHERE code = 'trial'").get() as {updatedAt: string};
     assert.equal(trial.updatedAt, "2026-08-18T00:01:00.000Z");
   } finally {

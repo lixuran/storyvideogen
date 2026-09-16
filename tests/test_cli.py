@@ -28,7 +28,7 @@ class CLITest(unittest.TestCase):
         self.assertEqual(args.translation_model, "glm-5.2")
         self.assertEqual(args.chunk_seconds, 30)
         self.assertEqual(args.image_provider, "zhipu")
-        self.assertEqual(args.image_model, "glm-image")
+        self.assertEqual(args.image_model, "cogview-3-flash")
         self.assertEqual(args.voice, "zh-CN-XiaoxiaoNeural")
 
     def test_ui_command_defaults_to_localhost(self) -> None:

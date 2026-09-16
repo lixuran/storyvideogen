@@ -15,7 +15,7 @@ from storyvideogen.provider_credentials import credential_value
 class ZhipuImageProvider:
     name = "zhipu"
 
-    def __init__(self, model: str = "glm-image", size: str = "1280x1280", max_retries: int = 4, api_key: str | None = None) -> None:
+    def __init__(self, model: str = "cogview-3-flash", size: str = "1344x768", max_retries: int = 4, api_key: str | None = None) -> None:
         self.model = model
         self.size = size
         self.max_retries = max_retries
@@ -41,6 +41,7 @@ class ZhipuImageProvider:
             "model": self.model,
             "prompt": prompt,
             "size": self.size,
+            "quality": "hd" if self.model == "glm-image" else "standard",
         }
         request = urllib.request.Request(
             "https://open.bigmodel.cn/api/paas/v4/images/generations",

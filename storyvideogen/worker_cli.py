@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -56,7 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         prompt = request["input"].get("prompt")
         if not isinstance(candidate_ids, list) or not 1 <= len(candidate_ids) <= 4 or not all(isinstance(value, str) for value in candidate_ids) or not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("Image generation request is invalid.")
-        provider = build_image_provider(str(request["input"].get("provider", "fixture")), model=str(request["input"].get("model") or "glm-image"))
+        provider = build_image_provider(
+            str(request["input"].get("provider", "fixture")),
+            model=str(request["input"].get("queryModel") or request["input"].get("model") or "cogview-3-flash"),
+        )
         stop_after_first_success = bool(request["input"].get("stopAfterFirstSuccess", False))
         image_dir = Path(str(request["storageRoot"])) / "images"
         candidates: list[dict[str, object]] = []
@@ -72,8 +76,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError("Synthetic slow first-candidate failure.")
                 asset = provider.fetch_image(prompt, image_dir, index)
                 candidates.append({"candidateId": candidate_id, "status": "ready", "file": str(asset.local_path.relative_to(Path(str(request["storageRoot"])))), "sourceUrl": asset.source_url, "creator": asset.creator, "licenseName": asset.license_name, "licenseUrl": asset.license_url})
-            except Exception:
-                candidates.append({"candidateId": candidate_id, "status": "failed", "error": "The provider could not generate this image candidate."})
+            except Exception as exc:
+                candidates.append({"candidateId": candidate_id, "status": "failed", "error": provider_error_message(exc)})
             send("progress", {"progress": 1000 + round(8000 * (index + 1) / len(candidate_ids))})
         result_file = Path(str(request["storageRoot"])) / "images.json"
         result_file.write_text(json.dumps({"contractVersion": 1, "storyId": request.get("storyId"), "candidates": candidates}, ensure_ascii=False), encoding="utf-8")
@@ -91,6 +95,12 @@ def main(argv: list[str] | None = None) -> int:
     if fixture == "duplicate_completion":
         send("completed", {"operation": args.operation})
     return 0
+
+
+def provider_error_message(error: Exception) -> str:
+    message = " ".join(str(error).split()) or type(error).__name__
+    message = re.sub(r"(?i)(authorization|api[_ -]?key)\s*[=:]\s*\S+", r"\1=[redacted]", message)
+    return f"Image provider failed: {message[:400]}"
 
 
 def load_request(request_path: Path, operation: str) -> dict[str, Any]:

@@ -20,7 +20,7 @@ class GenerationSettings:
     prompt_provider: str = "zai"
     prompt_model: str = "glm-5.2"
     image_provider: str = "zhipu"
-    image_model: str = "glm-image"
+    image_model: str = "cogview-3-flash"
     image_workers: int = 1
     tts_provider: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"

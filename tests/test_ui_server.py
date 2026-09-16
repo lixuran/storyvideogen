@@ -120,6 +120,7 @@ class UIServerTest(unittest.TestCase):
     def test_ui_exposes_account_settings_controls(self) -> None:
         self.assertIn('id="api-settings-form"', WEB_MAIN)
         self.assertIn('name="zai_api_key"', WEB_MAIN)
+        self.assertIn('name="pexels_api_key"', WEB_MAIN)
         self.assertIn('name="clear_zai_api_key"', WEB_MAIN)
         self.assertIn('id="password-settings-form"', WEB_MAIN)
         self.assertIn("/api/account/api-keys", WEB_MAIN)
@@ -137,13 +138,14 @@ class UIServerTest(unittest.TestCase):
         updates, clear_names = _api_key_updates_from_payload(
             {
                 "zai_api_key": "zai-secret",
+                "pexels_api_key": "pexels-secret",
                 "pixabay_api_key": "",
                 "clear_pixabay_api_key": True,
                 "ignored": "secret",
             }
         )
 
-        self.assertEqual(updates, {"ZAI_API_KEY": "zai-secret"})
+        self.assertEqual(updates, {"ZAI_API_KEY": "zai-secret", "PEXELS_API_KEY": "pexels-secret"})
         self.assertEqual(clear_names, {"PIXABAY_API_KEY"})
 
     def test_e2e_seed_helpers_write_prepared_and_composed_state(self) -> None:
@@ -168,7 +170,7 @@ class UIServerTest(unittest.TestCase):
 
     def test_ui_defaults_to_zhipu_image_provider(self) -> None:
         self.assertIn('<option value="zhipu" selected>zhipu</option>', WEB_MAIN)
-        self.assertIn('name="image_model" value="glm-image"', WEB_MAIN)
+        self.assertIn('name="image_model" value="cogview-3-flash"', WEB_MAIN)
         self.assertIn('name="image_workers" type="number" min="1" max="16" value="1"', WEB_MAIN)
         self.assertIn('name="candidates_per_chunk" type="number" min="1" max="6" value="2"', WEB_MAIN)
         self.assertIn("avoid HTTP 429 rate limits", WEB_MAIN)
@@ -181,7 +183,7 @@ class UIServerTest(unittest.TestCase):
             translator="mock",
             prompt_provider="heuristic",
             image_provider="zhipu",
-            image_model="glm-image",
+            image_model="cogview-3-flash",
             candidates_per_chunk=1,
         )
 

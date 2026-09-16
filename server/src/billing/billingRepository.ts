@@ -24,6 +24,6 @@ export class BillingRepository {
 }
 
 const planSeeds = [
-  {code: "trial", displayName: "Trial", priceFen: 0, periodDays: 7, quotas: {planning_jobs: 5, image_assets: 1_000, render_jobs: 2}, sortOrder: 0},
-  {code: "creator", displayName: "Creator", priceFen: 2_990, periodDays: 30, quotas: {planning_jobs: 100, image_assets: 1_000, render_jobs: 50}, sortOrder: 1}
+  {code: "trial", displayName: "Trial", priceFen: 0, periodDays: 7, quotas: {planning_jobs: 50, image_assets: 10_000, render_jobs: 20}, sortOrder: 0},
+  {code: "creator", displayName: "Creator", priceFen: 2_990, periodDays: 30, quotas: {planning_jobs: 1_000, image_assets: 10_000, render_jobs: 500}, sortOrder: 1}
 ] as const;

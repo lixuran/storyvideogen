@@ -88,7 +88,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const workerFixture = env.STORYVIDEOGEN_WORKER_FIXTURE?.trim() || "success";
   const authAttemptLimit = integerSetting(env.STORYVIDEOGEN_AUTH_ATTEMPT_LIMIT, 10, "STORYVIDEOGEN_AUTH_ATTEMPT_LIMIT", 1, 10_000);
   const zhipuTextModel = env.STORYVIDEOGEN_ZHIPU_TEXT_MODEL?.trim() || "glm-5.2";
-  const zhipuImageModel = env.STORYVIDEOGEN_ZHIPU_IMAGE_MODEL?.trim() || "glm-image";
+  const zhipuImageModel = env.STORYVIDEOGEN_ZHIPU_IMAGE_MODEL?.trim() || "cogview-3-flash";
   const paymentModeValue = env.STORYVIDEOGEN_PAYMENT_MODE?.trim().toLowerCase() || "disabled"; if (paymentModeValue !== "disabled" && paymentModeValue !== "fake") throw new Error("STORYVIDEOGEN_PAYMENT_MODE must be disabled or fake."); const paymentMode = paymentModeValue;
   return {
     host,

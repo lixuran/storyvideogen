@@ -4,13 +4,14 @@ from .baidu import BaiduImageProvider
 from .base import ImageProvider
 from .fixture import FixtureImageProvider
 from .openverse import OpenverseImageProvider
+from .pexels import PexelsImageProvider
 from .pixabay import PixabayImageProvider
 from .siliconflow import SiliconFlowImageProvider
 from .wikimedia import WikimediaImageProvider
 from .zhipu import ZhipuImageProvider
 
 
-def build_image_provider(name: str, model: str = "glm-image") -> ImageProvider:
+def build_image_provider(name: str, model: str = "cogview-3-flash") -> ImageProvider:
     normalized = name.strip().lower()
     if normalized == "baidu":
         return BaiduImageProvider()
@@ -18,6 +19,8 @@ def build_image_provider(name: str, model: str = "glm-image") -> ImageProvider:
         return FixtureImageProvider()
     if normalized == "openverse":
         return OpenverseImageProvider()
+    if normalized == "pexels":
+        return PexelsImageProvider(query_model=model)
     if normalized == "pixabay":
         return PixabayImageProvider()
     if normalized == "siliconflow":

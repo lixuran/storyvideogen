@@ -8,8 +8,10 @@ test("@m0 account settings and password change persist across login", async ({pa
 
   await openTab(page, "Account");
   await page.getByLabel("ZAI API key").fill("zai-test-key");
+  await page.getByLabel("Pexels API key").fill("pexels-test-key");
   await page.getByRole("button", {name: "Save API Settings"}).click();
   await expect(page.locator("#api-key-status")).toContainText("ZAI: configured");
+  await expect(page.locator("#api-key-status")).toContainText("Pexels: configured");
 
   await page.getByLabel("Current password").fill(user.password);
   await page.getByLabel("New password").fill("changed-password123");
@@ -20,6 +22,7 @@ test("@m0 account settings and password change persist across login", async ({pa
   await login(page, {username: user.username, password: "changed-password123"});
   await openTab(page, "Account");
   await expect(page.locator("#api-key-status")).toContainText("ZAI: configured");
+  await expect(page.locator("#api-key-status")).toContainText("Pexels: configured");
 });
 
 test("@m0 draft can be saved and restored after returning to the story", async ({page}) => {

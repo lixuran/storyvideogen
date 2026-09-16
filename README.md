@@ -31,9 +31,70 @@ Then open `http://127.0.0.1:3000`. Register or log in, save a named full-story d
 
 SQLite owns story/job metadata and opaque asset IDs. Generated and uploaded files are stored below `output/assets/`; filesystem paths are never accepted from the browser or returned by the API.
 
-For ZAI-powered translation, prompt generation, or Zhipu image generation, open the
-left-panel Settings section after login and save your `ZAI_API_KEY`. The UI stores
-the key for the current user and only shows whether each key is configured.
+For ZAI-powered translation, prompt generation, Zhipu image generation, or Pexels
+image search, open the left-panel Settings section after login and save the
+corresponding provider key. The UI encrypts the key for the current user and only
+shows whether each key is configured. Administrators can provide platform fallback
+keys from Admin Provider Keys.
+
+### Test semantic Pexels selection
+
+Run the commands in this section from the redesigned application directory (the
+directory containing `server/` and this README), not from the legacy Vite-only
+parent checkout:
+
+```powershell
+Set-Location "D:/huirui_backup/storyvideogen/pexels-workspace"
+```
+
+Pexels now prepares its searches with the configured Zhipu text model. For every
+scene it derives one to three concise English stock-photo queries, selects one or
+two concrete visual subjects as required concepts, searches all query variants,
+and rejects Pexels results whose title or alt metadata does not contain those
+subjects. It then ranks the remaining downloadable results instead of accepting
+the first result returned by the Pexels API.
+
+To test this through the local application:
+
+1. Build and restart both the API and worker after pulling the change:
+
+   ```powershell
+   npm run build
+   # In separate terminals, after stopping old processes:
+   npm start
+   npm run start:worker
+   ```
+
+2. Sign in, open **Settings**, and save both a **Zhipu AI** key and a **Pexels**
+   API key. The Zhipu key is used only to prepare the search query; the Pexels
+   key performs the image search and download.
+
+3. In **Create**, save a short draft and plan it. Use a scene with a distinct
+   visible subject, for example: `A solitary lighthouse stands above a moonlit
+   sea.` Select **Pexels** as the image source and generate one image candidate.
+
+4. Confirm that the returned image is relevant to the scene's primary subject
+   (a lighthouse in this example), rather than merely the first Pexels result.
+   The candidate attribution should link to a Pexels photo page. Repeat with an
+   unrelated subject or a Chinese scene; the query preparation is language- and
+   subject-independent.
+
+The deterministic test does not call external services or require keys:
+
+```powershell
+node scripts/run-python.mjs -m unittest tests.test_pexels_provider
+```
+
+It covers generic Chinese query preparation, constrained English query parsing,
+metadata rejection, ranking, retries, and the fallback path. The live suite runs
+full Zhipu planning followed by semantic Pexels selection, so it requires both
+provider keys:
+
+```powershell
+$env:ZAI_API_KEY="your-zhipu-api-key"
+$env:PEXELS_API_KEY="your-pexels-api-key"
+npm run verify:live:pexels
+```
 
 Run browser end-to-end tests:
 
@@ -107,6 +168,24 @@ image pins Node 24 and Python 3.12, verifies the FFmpeg `subtitles` filter and
 Noto CJK font during the build, and runs the API and one worker as an unprivileged
 UID 10001. Caddy is the only public container; the API is also bound to host
 loopback for health checks and SSH-tunnel testing.
+
+For a public VPS with Docker already installed, the shortest deployment path is:
+
+```bash
+git clone --branch codex/podcast-platform-redesign https://github.com/lixuran/storyvideogen.git /opt/storyvideogen
+cd /opt/storyvideogen
+cp deploy/docker/storyvideogen.env.example deploy/docker/storyvideogen.env
+chmod 600 deploy/docker/storyvideogen.env
+openssl rand -base64 32
+# Edit deploy/docker/storyvideogen.env: domain, ACME email, and generated master key.
+chmod +x deploy/deploy.sh
+./deploy/deploy.sh
+```
+
+`deploy/deploy.sh` validates the configuration, builds the application image,
+starts Caddy, the API, and one worker, waits for the API health check, and prints
+service status. It never creates or prints provider keys. Configure Zhipu and
+Pexels from authenticated **Settings** after the first login.
 
 ```bash
 git clone --branch codex/podcast-platform-redesign https://github.com/lixuran/storyvideogen.git /opt/storyvideogen
@@ -216,7 +295,10 @@ Install optional ZAI dependency for prompt planning and meaning-based Chinese tr
 node scripts/run-python.mjs -m pip install zai-sdk
 ```
 
-Zhipu `glm-image` is the default generated-image provider:
+Zhipu `cogview-3-flash` is the default generated-image provider. It uses the
+fast `standard` quality setting and a `1344x768` near-16:9 canvas. Use
+`glm-image` only when its slower HD quality or stronger Chinese text rendering
+is required:
 
 ```bash
 $env:ZHIPU_IMAGE_API_KEY="your-zhipu-or-bigmodel-api-key"
@@ -232,7 +314,7 @@ Live MVP path:
 
 ```bash
 $env:ZAI_API_KEY="your-zai-api-key"
-node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --chunk-seconds 30 --translator zai --translation-model glm-5.2 --image-provider zhipu --image-model glm-image --tts-provider edge --author "Author Name" --source-url "https://example.com/story" --story-license "CC BY-SA 3.0"
+node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --chunk-seconds 30 --translator zai --translation-model glm-5.2 --image-provider zhipu --image-model cogview-3-flash --tts-provider edge --author "Author Name" --source-url "https://example.com/story" --story-license "CC BY-SA 3.0"
 ```
 
 Faster image path with Pixabay:
@@ -241,6 +323,22 @@ Faster image path with Pixabay:
 $env:ZAI_API_KEY="your-zai-api-key"
 $env:PIXABAY_API_KEY="your-api-key"
 node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --translator zai --translation-model glm-5.2 --prompt-provider zai --prompt-model glm-5.2 --image-provider pixabay --image-workers 6 --tts-provider edge
+```
+
+Pexels photo-search path:
+
+```bash
+$env:ZAI_API_KEY="your-zai-api-key"
+$env:PEXELS_API_KEY="your-pexels-api-key"
+node scripts/run-python.mjs -m storyvideogen generate --story "input/story.txt" --title "Story Title" --out "output/story_title" --target-seconds 90 --translator zai --translation-model glm-5.2 --prompt-provider zai --prompt-model glm-5.2 --image-provider pexels --image-workers 4 --tts-provider edge
+```
+
+Pexels results retain the photographer, photo-page URL, and Pexels License in the
+image manifest and rendered credits. Obtain a key from the Pexels API dashboard.
+Run the explicit live browser verification with `PEXELS_API_KEY` set:
+
+```bash
+npm run verify:live:pexels
 ```
 
 China-oriented fast image path without an API key:

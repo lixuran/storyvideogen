@@ -13,6 +13,7 @@ test("@m14 auto mode finishes in the background with concurrent workers", async 
   await expect(page).toHaveURL(/\/create\?story=/);
   const storyId = new URL(page.url()).searchParams.get("story");
   expect(storyId).toBeTruthy();
+  await page.getByLabel("Auto image source").selectOption("pexels");
 
   await page.getByRole("button", {name: "Auto-create podcast"}).click();
   await expect(page.getByRole("status")).toContainText("Auto mode queued");
@@ -35,7 +36,9 @@ test("@m14 auto mode finishes in the background with concurrent workers", async 
     const imageJobs = database.prepare("SELECT payload_json FROM jobs WHERE story_id = ? AND type = 'generate_images' ORDER BY created_at, id").all(storyId);
     expect(imageJobs).toHaveLength(2);
     for (const row of imageJobs) {
-      const candidateIds = JSON.parse(row.payload_json).candidateIds;
+      const payload = JSON.parse(row.payload_json);
+      expect(payload.candidateProvider).toBe("pexels");
+      const candidateIds = payload.candidateIds;
       expect(database.prepare("SELECT is_selected FROM image_candidates WHERE id = ?").get(candidateIds[0]).is_selected).toBe(1);
     }
   } finally { database.close(); }
@@ -92,6 +95,34 @@ test("@m15 auto mode reports the quota failure that stopped planning", async ({p
   expect(await startFixtureWorker()).toBe(0);
   await expect.poll(async () => (await page.request.get(`/api/v1/stories/${storyId}/automation`)).json()).toMatchObject({state: "failed", errorCode: "QUOTA_EXCEEDED", errorMessage: "Your image assets quota is exhausted."});
   await expect(page.getByRole("status")).toContainText("image assets quota is exhausted");
+});
+
+test("@m16 auto Pexels mode clearly reports a missing Zhipu planning key", async ({page}) => {
+  expect((await page.request.post("/api/v1/auth/register", {data: {username: "m16-pexels-provider", password: "pexels-provider-password"}})).status()).toBe(201);
+  await page.goto("/create");
+  await page.getByLabel("Story name").fill("Pexels requires text planning");
+  await page.getByLabel("Full story").fill("A lighthouse keeper discovers a message inside an old brass telescope.");
+  await page.getByRole("button", {name: "Save draft"}).click();
+  await expect(page).toHaveURL(/\/create\?story=/);
+  const storyId = new URL(page.url()).searchParams.get("story");
+  expect(storyId).toBeTruthy();
+  await page.getByLabel("Auto image source").selectOption("pexels");
+  await page.getByRole("button", {name: "Auto-create podcast"}).click();
+
+  const database = openDatabase();
+  try {
+    const queued = database.prepare("SELECT id, payload_json FROM jobs WHERE story_id = ? AND type = 'plan_story'").get(storyId);
+    const payload = JSON.parse(queued.payload_json);
+    database.prepare("UPDATE jobs SET payload_json = ?, max_attempts = 1 WHERE id = ?").run(JSON.stringify({...payload, provider: "zhipu", requireLlm: true}), queued.id);
+  } finally { database.close(); }
+
+  expect(await startFixtureWorker()).toBe(0);
+  await expect.poll(async () => (await (await page.request.get(`/api/v1/stories/${storyId}/automation`)).json()), {timeout: 20_000}).toMatchObject({
+    state: "failed",
+    errorCode: "PROVIDER_UNAVAILABLE",
+    errorMessage: "Configure zhipu in Settings or ask an administrator to configure a platform key."
+  });
+  await expect(page.getByRole("status")).toContainText("Configure zhipu in Settings");
 });
 
 function seedImageUsageNearQuota() {
